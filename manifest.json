@@ -1,0 +1,16 @@
+{
+  "project": "NR17 Android Local MVP",
+  "version": "0.1.0",
+  "files": [
+    "main.py",
+    "buildozer.spec",
+    ".github/workflows/android.yml",
+    ".gitignore",
+    "teste.env.example",
+    "README.md",
+    "android_src/br/com/ibero/nr17/PoseAnalyzer.java"
+  ],
+  "pose_engine": "Google ML Kit Pose Detection 18.0.0-beta5",
+  "preview": "Kivy Camera local",
+  "analysis": "Android native ML Kit STREAM_MODE"
+}
