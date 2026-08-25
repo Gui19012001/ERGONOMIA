@@ -1,0 +1,17 @@
+teste.env
+.buildozer/
+bin/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+venv/
+.venv/
+.env/
+
+evidencias_nr17/
+*.pdf
+*.jpg
+*.jpeg
