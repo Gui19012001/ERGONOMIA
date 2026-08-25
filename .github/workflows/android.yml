@@ -1,0 +1,65 @@
+name: Build NR17 Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            ant autoconf automake ccache cmake g++ gcc gettext git lbzip2 \
+            libffi-dev libltdl-dev libncurses5-dev libncursesw5-dev libssl-dev \
+            libtool libtinfo6 make openjdk-17-jdk patch pkg-config \
+            python3-dev python3-pip python3-venv unzip wget zip zlib1g-dev
+
+      - name: Criar configuracao opcional
+        run: |
+          cat > teste.env <<'EOF'
+          CAMERA_TRASEIRA_INDEX=0
+          CAMERA_PREVIEW_ROTATION=270
+          POSE_ROTATION=270
+          CAMERA_WIDTH=1280
+          CAMERA_HEIGHT=720
+          POSE_INPUT_LONG_SIDE=640
+          POSE_INTERVAL=0.12
+          POSE_MIN_CONFIDENCE=0.45
+          IRE_TRONCO=25
+          IRE_PESCOCO=25
+          IRE_BRACO=60
+          IRE_JOELHO=130
+          EOF
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install setuptools cython==0.29.34 buildozer
+
+      - name: Build APK
+        run: |
+          buildozer android debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nr17-visao-apk
+          path: bin/*.apk
+          if-no-files-found: error
