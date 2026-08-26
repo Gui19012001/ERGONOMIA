@@ -37,6 +37,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt update
+
           sudo apt install -y \
             ant \
             autoconf \
@@ -73,6 +74,7 @@ jobs:
       - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip wheel
+
           python -m pip install \
             setuptools \
             cython==0.29.34 \
@@ -81,12 +83,11 @@ jobs:
       # ==========================================================
       # CONFIGURAÇÃO DO TABLET
       #
-      # CAMERA:
-      # O preview já está correto em landscape.
+      # CAMERA_PREVIEW_ROTATION=0
+      #   Camera já está correta em LANDSCAPE.
       #
-      # POSE:
-      # O frame bruto precisa ser compensado em 270 graus
-      # antes da interpretação do ML Kit.
+      # POSE_ROTATION=270
+      #   Corrige a orientação do frame enviado ao ML Kit.
       # ==========================================================
       - name: Criar configuracao tablet
         run: |
@@ -110,81 +111,123 @@ jobs:
           EOF
 
       # ==========================================================
-      # MOSTRAR CONFIGURAÇÃO
+      # CONFERIR CONFIGURAÇÃO
       # ==========================================================
       - name: Conferir configuracao tablet
         run: |
           echo "========================================"
           echo "CONFIGURACAO DO TABLET"
           echo "========================================"
+
           cat teste.env
+
+          echo "========================================"
+          echo "ROTACAO"
+          echo "========================================"
+          echo "Preview da camera : 0 graus"
+          echo "Pose ML Kit       : 270 graus"
           echo "========================================"
 
-          echo ""
-          echo "ROTACAO ESPERADA"
-          echo "Preview da camera: 0 graus"
-          echo "Pose ML Kit:       270 graus"
-          echo ""
-
       # ==========================================================
-      # LIMPEZA TOTAL
+      # LIMPEZA DO BUILD DO PROJETO
       #
-      # Evita reutilizar builds antigos com:
-      # - Python Android antigo
-      # - configuracao antiga de rotacao
-      # - caches anteriores
+      # Não apagamos ~/.buildozer aqui.
+      # O próprio runner é descartável e isso evita eliminar
+      # downloads válidos feitos durante a preparação.
       # ==========================================================
-      - name: Limpar completamente build anterior
+      - name: Limpar build anterior
         run: |
           rm -rf .buildozer
           rm -rf bin
-          rm -rf ~/.buildozer
-          rm -rf ~/.cache/pip
 
       # ==========================================================
-      # CONFERÊNCIA DO BUILDOZER
+      # CONFERÊNCIA
       # ==========================================================
-      - name: Conferir buildozer
+      - name: Conferir ambiente de build
         run: |
           echo "========================================"
           echo "HOST PYTHON"
+          echo "========================================"
           python --version
 
+          echo ""
           echo "========================================"
           echo "JAVA"
+          echo "========================================"
           java -version
 
+          echo ""
           echo "========================================"
           echo "P4A CONFIGURADO"
-          grep "^p4a.branch" buildozer.spec
+          echo "========================================"
+          grep "^p4a.branch" buildozer.spec || true
 
+          echo ""
           echo "========================================"
           echo "REQUIREMENTS"
-          grep "^requirements" buildozer.spec
-
           echo "========================================"
-          echo "ANDROID API / MIN API / NDK"
+          grep "^requirements" buildozer.spec || true
+
+          echo ""
+          echo "========================================"
+          echo "ANDROID API"
+          echo "========================================"
           grep "^android.api" buildozer.spec || true
+
+          echo ""
+          echo "========================================"
+          echo "ANDROID MIN API"
+          echo "========================================"
           grep "^android.minapi" buildozer.spec || true
+
+          echo ""
+          echo "========================================"
+          echo "ANDROID NDK"
+          echo "========================================"
           grep "^android.ndk" buildozer.spec || true
 
+          echo ""
           echo "========================================"
           echo "ML KIT"
+          echo "========================================"
           grep "^android.gradle_dependencies" buildozer.spec || true
 
+          echo ""
           echo "========================================"
 
       # ==========================================================
       # BUILD APK
+      #
+      # IMPORTANTE:
+      # O servidor principal do FreeType retornou HTTP 502.
+      #
+      # O p4a v2024.01.21 usa FreeType 2.10.1 e permite
+      # sobrescrever a URL através de URL_freetype.
       # ==========================================================
       - name: Build APK
         env:
           PYTHONFORANDROID_PREREQUISITES_INSTALL_INTERACTIVE: "0"
+
+          # Mirror Savannah para evitar:
+          # download.savannah.gnu.org -> HTTP 502
+          URL_freetype: "https://download-mirror.savannah.gnu.org/releases/freetype/freetype-{version}.tar.gz"
+
         run: |
+          echo "========================================"
+          echo "INICIANDO BUILD ANDROID"
+          echo "========================================"
+
+          echo ""
+          echo "FREETYPE MIRROR:"
+          echo "$URL_freetype"
+
+          echo ""
+          echo "========================================"
+
           buildozer -v android debug
 
       # ==========================================================
-      # LOCALIZAR APK
+      # VERIFICAR APK
       # ==========================================================
       - name: Conferir APK gerado
         run: |
@@ -194,19 +237,24 @@ jobs:
 
           find bin -maxdepth 1 -type f -name "*.apk" -print
 
-          echo "========================================"
-
           APK_COUNT=$(find bin -maxdepth 1 -type f -name "*.apk" | wc -l)
 
+          echo ""
+          echo "Total de APKs encontrados: $APK_COUNT"
+
           if [ "$APK_COUNT" -eq 0 ]; then
-            echo "ERRO: Nenhum APK encontrado."
+            echo ""
+            echo "ERRO: Nenhum APK foi encontrado."
             exit 1
           fi
 
-          echo "Total de APKs encontrados: $APK_COUNT"
+          echo ""
+          echo "========================================"
+          echo "BUILD FINALIZADO COM SUCESSO"
+          echo "========================================"
 
       # ==========================================================
-      # ARTIFACT
+      # UPLOAD DO APK
       # ==========================================================
       - name: Upload APK
         uses: actions/upload-artifact@v4
