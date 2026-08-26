@@ -1,6 +1,6 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP
-# Kivy + câmera local + ML Kit Pose Android + IRE/RULA/REBA
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.3
+# Kivy + ML Kit local + overlay calibrado + evidências + PDF
 # ============================================================
 
 import os
@@ -99,6 +99,15 @@ POSE_LONG_SIDE = env_int("POSE_INPUT_LONG_SIDE", 640)
 POSE_INTERVAL = max(0.08, env_float("POSE_INTERVAL", 0.12))
 MIN_CONFIDENCE = max(0.25, min(0.95, env_float("POSE_MIN_CONFIDENCE", 0.45)))
 
+# Para cálculo de ângulos usamos uma confiança mais rígida que a visualização.
+ANGLE_MIN_CONFIDENCE = max(
+    MIN_CONFIDENCE,
+    min(0.95, env_float("ANGLE_MIN_CONFIDENCE", 0.60))
+)
+LANDMARK_CONFIRM_FRAMES = max(1, env_int("LANDMARK_CONFIRM_FRAMES", 2))
+LANDMARK_JUMP_LIMIT = max(0.03, min(0.50, env_float("LANDMARK_JUMP_LIMIT", 0.18)))
+LANDMARK_SMOOTH_ALPHA = max(0.10, min(1.0, env_float("LANDMARK_SMOOTH_ALPHA", 0.65)))
+
 TRUNK_LIMIT = env_float("IRE_TRONCO", 25.0)
 NECK_LIMIT = env_float("IRE_PESCOCO", 25.0)
 ARM_LIMIT = env_float("IRE_BRACO", 60.0)
@@ -153,6 +162,88 @@ def fmt_seconds(seconds):
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def source_xy(obj):
+    """Coordenada normalizada na geometria ORIGINAL da textura da câmera."""
+    if not obj:
+        return None
+    try:
+        x = float(obj.get("sx", obj.get("x")))
+        y = float(obj.get("sy", obj.get("y")))
+        return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
+    except Exception:
+        return None
+
+
+def rotate_norm_ccw(x, y, degrees):
+    """Rotaciona coordenada normalizada para acompanhar CAMERA_PREVIEW_ROTATION."""
+    r = int(degrees or 0) % 360
+    if r == 90:
+        return y, 1.0 - x
+    if r == 180:
+        return 1.0 - x, 1.0 - y
+    if r == 270:
+        return 1.0 - y, x
+    return x, y
+
+
+def safe_pct(part, total):
+    return 100.0 * float(part) / float(total) if total else 0.0
+
+
+def load_report_font(size, bold=False):
+    candidates = []
+    if bold:
+        candidates.extend([
+            "/system/fonts/Roboto-Bold.ttf",
+            "/system/fonts/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ])
+    else:
+        candidates.extend([
+            "/system/fonts/Roboto-Regular.ttf",
+            "/system/fonts/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ])
+    for path in candidates:
+        try:
+            if Path(path).exists():
+                return ImageFont.truetype(path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def draw_wrapped(draw, text, xy, font, fill, max_width, line_gap=6):
+    """Desenha texto quebrando linha por largura real."""
+    x, y = xy
+    words = str(text or "").split()
+    line = ""
+    lines = []
+    for word in words:
+        test = word if not line else f"{line} {word}"
+        try:
+            box = draw.textbbox((0, 0), test, font=font)
+            width = box[2] - box[0]
+        except Exception:
+            width = len(test) * 8
+        if line and width > max_width:
+            lines.append(line)
+            line = word
+        else:
+            line = test
+    if line:
+        lines.append(line)
+    try:
+        bbox = draw.textbbox((0, 0), "Ag", font=font)
+        line_h = max(18, bbox[3] - bbox[1] + line_gap)
+    except Exception:
+        line_h = 24
+    for item in lines:
+        draw.text((x, y), item, font=font, fill=fill)
+        y += line_h
+    return y
 
 
 # ------------------------------------------------------------------
@@ -374,14 +465,14 @@ POSE_CONNECTIONS = [
 ]
 
 
-def landmark_point(landmarks, name, min_conf=MIN_CONFIDENCE):
+def landmark_point(landmarks, name, min_conf=ANGLE_MIN_CONFIDENCE):
     obj = (landmarks or {}).get(name)
     if not obj:
         return None
     try:
         if float(obj.get("c", 0)) < min_conf:
             return None
-        return (float(obj["x"]), float(obj["y"]))
+        return source_xy(obj)
     except Exception:
         return None
 
@@ -432,8 +523,20 @@ def derive_pose_values(landmarks):
         "knee_l": kn_l, "knee_r": kn_r,
     }
     vals["ire"] = calc_ire(vals)
-    vals["rula"] = calculate_rula(vals, side="right")
-    vals["reba"] = calculate_reba(vals, side="right")
+
+    right_ready = all(v is not None for v in [sh_r, el_r])
+    left_ready = all(v is not None for v in [sh_l, el_l])
+    analysis_side = "right" if right_ready else ("left" if left_ready else None)
+    vals["analysis_side"] = analysis_side or "--"
+
+    base_ready = trunk is not None and neck is not None and analysis_side is not None
+    if base_ready:
+        vals["rula"] = calculate_rula(vals, side=analysis_side)
+        knee_side = kn_r if analysis_side == "right" else kn_l
+        vals["reba"] = calculate_reba(vals, side=analysis_side) if knee_side is not None else 0
+    else:
+        vals["rula"] = 0
+        vals["reba"] = 0
     return vals
 
 
@@ -490,11 +593,24 @@ class MetricCard(Card):
 
 
 class PoseOverlay(Widget):
+    """
+    Overlay calibrado.
+
+    O Java devolve sx/sy no espaço ORIGINAL da textura.
+    O overlay transforma essas coordenadas somente pela rotação usada no preview
+    e desenha dentro do retângulo real da imagem (letterbox/pillarbox respeitado).
+    """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.landmarks = {}
         self.valid = False
+        self.image_rect = None
+        self.preview_rotation = CAMERA_PREVIEW_ROTATION
         self.bind(pos=lambda *_: self.redraw(), size=lambda *_: self.redraw())
+
+    def set_image_rect(self, x, y, w, h):
+        self.image_rect = (float(x), float(y), float(w), float(h))
+        self.redraw()
 
     def set_pose(self, landmarks, valid=True):
         self.landmarks = landmarks or {}
@@ -511,18 +627,28 @@ class PoseOverlay(Widget):
         if not self.landmarks:
             return
 
+        rx, ry, rw, rh = self.image_rect or (self.x, self.y, self.width, self.height)
+        if rw <= 1 or rh <= 1:
+            return
+
         def xy(name):
             obj = self.landmarks.get(name)
             if not obj:
                 return None
             try:
-                if float(obj.get("c", 0)) < MIN_CONFIDENCE:
+                if float(obj.get("c", 0)) < ANGLE_MIN_CONFIDENCE:
                     return None
-                xn = clamp(float(obj["x"]), 0, 1)
-                yn = clamp(float(obj["y"]), 0, 1)
+
+                pt = source_xy(obj)
+                if pt is None:
+                    return None
+                xn, yn = pt
+                xn, yn = rotate_norm_ccw(xn, yn, self.preview_rotation)
+
+                # ML Kit usa origem no topo; Kivy usa origem embaixo.
                 return (
-                    self.x + xn * self.width,
-                    self.y + (1.0 - yn) * self.height,
+                    rx + xn * rw,
+                    ry + (1.0 - yn) * rh,
                 )
             except Exception:
                 return None
@@ -579,6 +705,18 @@ class NR17Screen(BoxLayout):
         self.cycle_active = False
         self.cycle_start_total = 0.0
         self.cycle_count = 0
+        self.cycle_records = []
+
+        # Avaliação / relatório
+        self.assessment_started_at = datetime.now()
+        self.assessment_id = self.assessment_started_at.strftime("%Y%m%d_%H%M%S")
+        self.assessment_dir = None
+        self.evidence_records = []
+        self.last_exported_report = None
+
+        # Filtro temporal para reduzir landmarks "fantasmas".
+        self._landmark_state = {}
+        self._landmark_streak = {}
 
         self._frame_worker_busy = False
         self._running = False
@@ -609,7 +747,7 @@ class NR17Screen(BoxLayout):
         header = Card(size_hint_y=None, height=dp(62), padding=dp(10), spacing=dp(10))
         title_box = BoxLayout(orientation="vertical")
         title_box.add_widget(self._label("NR-17 | ERGONOMIA POR VISÃO", CYAN, "20sp", True))
-        title_box.add_widget(self._label("Câmera local + pose local no Android · sem Streamlit", MUTED, "11sp"))
+        title_box.add_widget(self._label("Câmera local + ML Kit · overlay calibrado · PDF com evidências", MUTED, "11sp"))
         self.status_lbl = self._label(self.status_text, YELLOW, "11sp", True)
         self.bind(status_text=lambda *_: setattr(self.status_lbl, "text", self.status_text))
         header.add_widget(title_box)
@@ -634,11 +772,12 @@ class NR17Screen(BoxLayout):
         self.preview_area = FloatLayout()
         left.add_widget(self.preview_area)
 
-        controls = GridLayout(cols=5, size_hint_y=None, height=dp(52), spacing=dp(5))
+        controls = GridLayout(cols=6, size_hint_y=None, height=dp(52), spacing=dp(5))
         controls.add_widget(self._button("INICIAR", self.start_camera, primary=True))
         controls.add_widget(self._button("PARAR", self.stop_camera))
         controls.add_widget(self._button("CICLO", self.toggle_cycle))
         controls.add_widget(self._button("EVIDÊNCIA", self.capture_evidence))
+        controls.add_widget(self._button("RELATÓRIO", self.generate_report))
         controls.add_widget(self._button("ZERAR", self.reset_measurement))
         left.add_widget(controls)
         main.add_widget(left)
@@ -744,6 +883,38 @@ class NR17Screen(BoxLayout):
         self.preview_area.bind(size=self._fit_preview, pos=self._fit_preview)
         Clock.schedule_once(lambda dt: self._fit_preview(), 0.1)
 
+    def _preview_image_rect(self):
+        """
+        Retorna o retângulo EXATO onde a textura aparece dentro do painel.
+        Corrige o deslocamento causado por keep_ratio=True.
+        """
+        if not self.preview_area:
+            return (0, 0, 0, 0)
+
+        ax, ay = self.preview_area.pos
+        aw, ah = self.preview_area.size
+        if aw <= 1 or ah <= 1:
+            return (ax, ay, aw, ah)
+
+        tw, th = CAM_W, CAM_H
+        try:
+            if self.camera and self.camera.texture:
+                tw, th = [float(v) for v in self.camera.texture.size]
+        except Exception:
+            pass
+
+        if int(CAMERA_PREVIEW_ROTATION) % 180 == 90:
+            tw, th = th, tw
+
+        if tw <= 0 or th <= 0:
+            return (ax, ay, aw, ah)
+
+        scale = min(aw / tw, ah / th)
+        dw, dh = tw * scale, th * scale
+        dx = ax + (aw - dw) / 2.0
+        dy = ay + (ah - dh) / 2.0
+        return (dx, dy, dw, dh)
+
     def _fit_preview(self, *_):
         if not self.camera or not self.scatter or not self.preview_area:
             return
@@ -768,6 +939,8 @@ class NR17Screen(BoxLayout):
 
         self.overlay.pos = self.preview_area.pos
         self.overlay.size = self.preview_area.size
+        self.overlay.preview_rotation = CAMERA_PREVIEW_ROTATION
+        self.overlay.set_image_rect(*self._preview_image_rect())
 
     def start_camera(self, *_):
         if self.camera is None:
@@ -868,6 +1041,61 @@ class NR17Screen(BoxLayout):
     def _set_status(self, text):
         self.status_text = str(text)
 
+    def _filter_landmarks(self, landmarks):
+        """
+        Confirma cada ponto por alguns frames, suaviza e rejeita saltos impossíveis.
+        A geometria usada é sx/sy (textura original), não x/y da imagem rotacionada.
+        """
+        filtered = {}
+        seen = set()
+
+        for name, obj in (landmarks or {}).items():
+            try:
+                conf = float(obj.get("c", 0))
+            except Exception:
+                conf = 0.0
+            if conf < ANGLE_MIN_CONFIDENCE:
+                self._landmark_streak[name] = 0
+                continue
+
+            pt = source_xy(obj)
+            if pt is None:
+                self._landmark_streak[name] = 0
+                continue
+
+            x, y = pt
+            prev = self._landmark_state.get(name)
+
+            if prev is not None:
+                px, py = prev["sx"], prev["sy"]
+                jump = math.hypot(x - px, y - py)
+                if jump > LANDMARK_JUMP_LIMIT:
+                    # Não perpetuamos o ponto antigo: este frame fica inválido.
+                    self._landmark_streak[name] = 0
+                    continue
+
+                a = LANDMARK_SMOOTH_ALPHA
+                x = a*x + (1.0-a)*px
+                y = a*y + (1.0-a)*py
+
+            self._landmark_streak[name] = self._landmark_streak.get(name, 0) + 1
+
+            new_obj = dict(obj)
+            new_obj["sx"] = clamp(x, 0.0, 1.0)
+            new_obj["sy"] = clamp(y, 0.0, 1.0)
+            self._landmark_state[name] = new_obj
+            seen.add(name)
+
+            if self._landmark_streak[name] >= LANDMARK_CONFIRM_FRAMES:
+                filtered[name] = new_obj
+
+        # Landmark que desapareceu não pode continuar "congelado".
+        for name in list(self._landmark_streak.keys()):
+            if name not in seen:
+                self._landmark_streak[name] = 0
+
+        return filtered
+
     def _poll_pose_result(self, _dt):
         if not self.pose_analyzer:
             return
@@ -899,20 +1127,26 @@ class NR17Screen(BoxLayout):
             self.detail_lbl.text = f"ML Kit {data.get('inferenceMs',0)} ms"
             return
 
-        landmarks = data.get("landmarks") or {}
+        raw_landmarks = data.get("landmarks") or {}
+        landmarks = self._filter_landmarks(raw_landmarks)
         quality, coverage = pose_quality(landmarks)
         values = derive_pose_values(landmarks)
+        data["landmarks_filtered"] = landmarks
 
         now = time.monotonic()
         dt = clamp(now - self.last_metrics_tick, 0.0, 0.4)
         self.last_metrics_tick = now
         self.last_valid_pose_time = now
 
-        self._accumulate(values, dt)
+        if values.get("trunk") is not None and values.get("neck") is not None:
+            self._accumulate(values, dt)
+        else:
+            self.invalid_time += dt
         self.last_values = values
 
-        valid = quality >= 55.0
+        valid = quality >= 55.0 and len(landmarks) >= 6
         if self.overlay:
+            self.overlay.set_image_rect(*self._preview_image_rect())
             self.overlay.set_pose(landmarks, valid=valid)
 
         self._update_ui(data, landmarks, values, quality, coverage)
@@ -980,77 +1214,401 @@ class NR17Screen(BoxLayout):
             duration = max(0.0, self.total_time - self.cycle_start_total)
             self.cycle_count += 1
             self.cycle_active = False
+            self.cycle_records.append({
+                "ciclo": self.cycle_count,
+                "duracao_s": round(duration, 2),
+                "fechado_em": datetime.now().isoformat(timespec="seconds"),
+            })
+            self._save_assessment_json()
             self.status_text = f"Ciclo {self.cycle_count} fechado · {fmt_seconds(duration)}."
 
-    def _evidence_dir(self):
+    def _assessment_dir(self):
         app = App.get_running_app()
-        base = Path(getattr(app, "user_data_dir", str(BASE_DIR))) / "evidencias_nr17"
+        if self.assessment_dir is None:
+            base = Path(getattr(app, "user_data_dir", str(BASE_DIR))) / "avaliacoes_nr17"
+            self.assessment_dir = base / self.assessment_id
+            self.assessment_dir.mkdir(parents=True, exist_ok=True)
+        return self.assessment_dir
+
+    def _evidence_dir(self):
+        base = self._assessment_dir() / "evidencias"
         base.mkdir(parents=True, exist_ok=True)
         return base
 
-    def capture_evidence(self, *_):
-        if not self.camera or self.camera.texture is None:
-            self.status_text = "Sem imagem disponível para evidência."
-            return
+    def _assessment_snapshot(self):
+        v = dict(self.last_values or {})
+        total = float(self.total_time or 0)
+        return {
+            "assessment_id": self.assessment_id,
+            "inicio": self.assessment_started_at.isoformat(timespec="seconds"),
+            "atualizado_em": datetime.now().isoformat(timespec="seconds"),
+            "setor": self.in_setor.text.strip(),
+            "posto": self.in_posto.text.strip(),
+            "colaborador": self.in_colab.text.strip(),
+            "tempo_valido_s": round(total, 2),
+            "tempo_invalido_s": round(float(self.invalid_time), 2),
+            "exposicao_total_pct": round(safe_pct(self.risk_time, total), 2),
+            "exposicao_tronco_pct": round(safe_pct(self.trunk_time, total), 2),
+            "exposicao_pescoco_pct": round(safe_pct(self.neck_time, total), 2),
+            "exposicao_braco_pct": round(safe_pct(self.arm_time, total), 2),
+            "exposicao_joelho_pct": round(safe_pct(self.knee_time, total), 2),
+            "eventos": int(self.events),
+            "ciclos": list(self.cycle_records),
+            "max_ire": int(self.max_ire),
+            "max_rula": int(self.max_rula),
+            "max_reba": int(self.max_reba),
+            "ultimo": v,
+            "evidencias": list(self.evidence_records),
+            "config": {
+                "camera_preview_rotation": CAMERA_PREVIEW_ROTATION,
+                "pose_rotation": POSE_ROTATION,
+                "pose_min_confidence": MIN_CONFIDENCE,
+                "angle_min_confidence": ANGLE_MIN_CONFIDENCE,
+                "confirm_frames": LANDMARK_CONFIRM_FRAMES,
+                "jump_limit": LANDMARK_JUMP_LIMIT,
+            },
+        }
 
+    def _save_assessment_json(self):
         try:
-            size = tuple(int(x) for x in self.camera.texture.size)
-            pixels = bytes(self.camera.texture.pixels)
-            img = Image.frombytes("RGBA", size, pixels)
-            if POSE_ROTATION:
-                img = img.rotate(POSE_ROTATION, expand=True)
-            img = img.convert("RGB")
+            path = self._assessment_dir() / "dados_avaliacao.json"
+            path.write_text(
+                json.dumps(self._assessment_snapshot(), ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            return path
+        except Exception:
+            return None
 
-            draw = ImageDraw.Draw(img)
-            landmarks = (self.last_pose_data or {}).get("landmarks") or {}
+    def _capture_evidence_file(self):
+        if not self.camera or self.camera.texture is None:
+            raise RuntimeError("Sem imagem disponível para evidência.")
 
-            def pxy(name):
-                obj = landmarks.get(name)
-                if not obj or float(obj.get("c", 0)) < MIN_CONFIDENCE:
+        size = tuple(int(x) for x in self.camera.texture.size)
+        pixels = bytes(self.camera.texture.pixels)
+        img = Image.frombytes("RGBA", size, pixels)
+
+        # Evidência acompanha o preview, NÃO a rotação usada somente pelo ML Kit.
+        if CAMERA_PREVIEW_ROTATION:
+            img = img.rotate(CAMERA_PREVIEW_ROTATION, expand=True)
+        img = img.convert("RGB")
+
+        draw = ImageDraw.Draw(img)
+        landmarks = {}
+        if self.last_pose_data:
+            landmarks = (
+                self.last_pose_data.get("landmarks_filtered")
+                or self._filter_landmarks(self.last_pose_data.get("landmarks") or {})
+            )
+
+        def pxy(name):
+            obj = landmarks.get(name)
+            if not obj:
+                return None
+            try:
+                if float(obj.get("c", 0)) < ANGLE_MIN_CONFIDENCE:
                     return None
+                pt = source_xy(obj)
+                if pt is None:
+                    return None
+                xn, yn = rotate_norm_ccw(pt[0], pt[1], CAMERA_PREVIEW_ROTATION)
                 return (
-                    int(clamp(float(obj["x"]), 0, 1) * img.width),
-                    int(clamp(float(obj["y"]), 0, 1) * img.height),
+                    int(clamp(xn, 0, 1) * img.width),
+                    int(clamp(yn, 0, 1) * img.height),
+                )
+            except Exception:
+                return None
+
+        for a, b in POSE_CONNECTIONS:
+            pa, pb = pxy(a), pxy(b)
+            if pa and pb:
+                draw.line([pa, pb], fill=(25, 225, 190), width=max(3, img.width // 320))
+
+        rr = max(4, img.width // 220)
+        for name in KEY_LANDMARKS:
+            pt = pxy(name)
+            if pt:
+                draw.ellipse(
+                    (pt[0]-rr, pt[1]-rr, pt[0]+rr, pt[1]+rr),
+                    fill=(255,255,255),
+                    outline=(25,225,190),
+                    width=max(2, img.width // 500),
                 )
 
-            for a, b in POSE_CONNECTIONS:
-                pa, pb = pxy(a), pxy(b)
-                if pa and pb:
-                    draw.line([pa, pb], fill=(50, 230, 255), width=max(3, img.width // 320))
+        values = dict(self.last_values or {})
+        panel_h = max(110, int(img.height * 0.16))
+        draw.rectangle((0, img.height-panel_h, img.width, img.height), fill=(8, 20, 34))
 
-            rr = max(4, img.width // 220)
-            for name in KEY_LANDMARKS:
-                pt = pxy(name)
-                if pt:
-                    draw.ellipse(
-                        (pt[0]-rr, pt[1]-rr, pt[0]+rr, pt[1]+rr),
-                        fill=(255,255,255),
-                        outline=(50,230,255),
-                        width=max(2, img.width // 500),
-                    )
+        f_big = load_report_font(max(18, img.width // 55), bold=True)
+        f_small = load_report_font(max(14, img.width // 75), bold=False)
 
-            values = self.last_values or {}
-            panel_h = max(84, int(img.height * 0.13))
-            draw.rectangle((0, img.height-panel_h, img.width, img.height), fill=(8, 20, 34))
-            text = (
-                f"NR-17 | IRE {values.get('ire',0)} | "
-                f"RULA {values.get('rula',0)}/7 | REBA {values.get('reba',0)}/15 | "
-                f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-            )
-            draw.text((20, img.height-panel_h+18), text, fill="white")
-            draw.text(
-                (20, img.height-panel_h+48),
-                f"Setor: {self.in_setor.text or '-'} | Posto: {self.in_posto.text or '-'} | Colaborador: {self.in_colab.text or '-'}",
-                fill=(200,220,235)
-            )
+        draw.text(
+            (20, img.height-panel_h+14),
+            f"NR-17 | IRE {values.get('ire',0)} | RULA {values.get('rula',0)}/7 | REBA {values.get('reba',0)}/15",
+            font=f_big, fill="white"
+        )
+        draw.text(
+            (20, img.height-panel_h+50),
+            f"Tronco {fmt_angle(values.get('trunk'))} | Pescoco {fmt_angle(values.get('neck'))} | "
+            f"Braco D/E {fmt_angle(values.get('shoulder_r'))}/{fmt_angle(values.get('shoulder_l'))}",
+            font=f_small, fill=(205,225,238)
+        )
+        draw.text(
+            (20, img.height-panel_h+78),
+            f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} | "
+            f"Setor: {self.in_setor.text or '-'} | Posto: {self.in_posto.text or '-'} | "
+            f"Colaborador: {self.in_colab.text or '-'}",
+            font=f_small, fill=(205,225,238)
+        )
 
-            path = self._evidence_dir() / f"nr17_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            img.save(str(path), "JPEG", quality=94)
-            self.status_text = f"Evidência salva: {path.name}"
+        idx = len(self.evidence_records) + 1
+        path = self._evidence_dir() / f"evidencia_{idx:03d}.jpg"
+        img.save(str(path), "JPEG", quality=94)
+
+        record = {
+            "numero": idx,
+            "arquivo": str(path),
+            "capturada_em": datetime.now().isoformat(timespec="seconds"),
+            "ire": int(values.get("ire", 0) or 0),
+            "rula": int(values.get("rula", 0) or 0),
+            "reba": int(values.get("reba", 0) or 0),
+            "trunk": values.get("trunk"),
+            "neck": values.get("neck"),
+            "shoulder_r": values.get("shoulder_r"),
+            "shoulder_l": values.get("shoulder_l"),
+            "knee_r": values.get("knee_r"),
+            "knee_l": values.get("knee_l"),
+        }
+        self.evidence_records.append(record)
+        self._save_assessment_json()
+        return path, record
+
+    def capture_evidence(self, *_):
+        try:
+            path, _record = self._capture_evidence_file()
+            self.status_text = f"Evidência {len(self.evidence_records)} salva: {path.name}"
         except Exception as exc:
             self.status_text = f"Erro ao salvar evidência: {exc}"
 
+    def _pdf_summary_page(self, snapshot):
+        W, H = 1240, 1754
+        page = Image.new("RGB", (W, H), "white")
+        d = ImageDraw.Draw(page)
+
+        navy = (13, 41, 68)
+        cyan = (0, 145, 205)
+        dark = (25, 35, 45)
+        gray = (90, 105, 118)
+        light = (238, 244, 248)
+
+        f_title = load_report_font(46, bold=True)
+        f_sub = load_report_font(25, bold=False)
+        f_h = load_report_font(29, bold=True)
+        f = load_report_font(23, bold=False)
+        f_b = load_report_font(23, bold=True)
+        f_big = load_report_font(42, bold=True)
+        f_note = load_report_font(19, bold=False)
+
+        d.rectangle((0, 0, W, 190), fill=navy)
+        d.text((65, 48), "NR-17 | RELATORIO ERGONOMICO POR VISAO", font=f_title, fill="white")
+        d.text((67, 116), f"Avaliacao {snapshot['assessment_id']}", font=f_sub, fill=(190, 220, 238))
+
+        y = 230
+        d.text((65, y), "IDENTIFICACAO", font=f_h, fill=navy)
+        y += 55
+        fields = [
+            ("Setor", snapshot.get("setor") or "-"),
+            ("Operacao / Posto", snapshot.get("posto") or "-"),
+            ("Colaborador", snapshot.get("colaborador") or "-"),
+            ("Inicio", snapshot.get("inicio") or "-"),
+            ("Tempo valido", fmt_seconds(snapshot.get("tempo_valido_s", 0))),
+            ("Evidencias", str(len(snapshot.get("evidencias", [])))),
+        ]
+        for label, value in fields:
+            d.text((70, y), f"{label}:", font=f_b, fill=dark)
+            d.text((300, y), str(value), font=f, fill=dark)
+            y += 38
+
+        y += 25
+        d.text((65, y), "RESUMO DE RISCO", font=f_h, fill=navy)
+        y += 55
+
+        cards = [
+            ("IRE MAX", f"{snapshot.get('max_ire',0)}/100"),
+            ("RULA MAX", f"{snapshot.get('max_rula',0)}/7"),
+            ("REBA MAX", f"{snapshot.get('max_reba',0)}/15"),
+            ("EXPOSICAO", f"{snapshot.get('exposicao_total_pct',0):.1f}%"),
+        ]
+        x0 = 65
+        card_w = 260
+        gap = 22
+        for i, (label, value) in enumerate(cards):
+            x = x0 + i*(card_w+gap)
+            d.rounded_rectangle((x, y, x+card_w, y+140), radius=18, fill=light, outline=(205,218,226), width=2)
+            d.text((x+18, y+18), label, font=f_b, fill=gray)
+            d.text((x+18, y+62), value, font=f_big, fill=cyan if i < 3 else navy)
+        y += 185
+
+        d.text((65, y), "EXPOSICAO CORPORAL", font=f_h, fill=navy)
+        y += 55
+        exposure = [
+            ("Tronco", snapshot.get("exposicao_tronco_pct",0)),
+            ("Pescoco", snapshot.get("exposicao_pescoco_pct",0)),
+            ("Braco elevado", snapshot.get("exposicao_braco_pct",0)),
+            ("Joelho", snapshot.get("exposicao_joelho_pct",0)),
+        ]
+        for label, pct in exposure:
+            pct = float(pct or 0)
+            d.text((70, y), f"{label}: {pct:.1f}%", font=f, fill=dark)
+            bx, by, bw, bh = 360, y+4, 720, 24
+            d.rounded_rectangle((bx, by, bx+bw, by+bh), radius=10, fill=(230,235,239))
+            d.rounded_rectangle((bx, by, bx+bw*clamp(pct/100,0,1), by+bh), radius=10, fill=cyan)
+            y += 48
+
+        y += 18
+        latest = snapshot.get("ultimo") or {}
+        d.text((65, y), "ULTIMA POSTURA VALIDA", font=f_h, fill=navy)
+        y += 52
+        angle_lines = [
+            f"Tronco: {fmt_angle(latest.get('trunk'))}    Pescoco: {fmt_angle(latest.get('neck'))}",
+            f"Braco D/E: {fmt_angle(latest.get('shoulder_r'))} / {fmt_angle(latest.get('shoulder_l'))}",
+            f"Joelho D/E: {fmt_angle(latest.get('knee_r'))} / {fmt_angle(latest.get('knee_l'))}",
+            f"Eventos de risco: {snapshot.get('eventos',0)}    Ciclos fechados: {len(snapshot.get('ciclos',[]))}",
+        ]
+        for line in angle_lines:
+            d.text((70, y), line, font=f, fill=dark)
+            y += 40
+
+        y += 25
+        d.rounded_rectangle((60, y, W-60, y+205), radius=16, fill=(248,249,250), outline=(220,226,230), width=2)
+        d.text((80, y+22), "NOTA METODOLOGICA", font=f_b, fill=navy)
+        note = (
+            "RULA, REBA e IRE sao calculos assistidos por visao computacional. "
+            "A camera 2D nao determina automaticamente todos os fatores ergonomicos, "
+            "como carga, pega, forca, repetitividade, apoio e torcoes fora do plano. "
+            "O relatorio apoia AEP/AET e deve ser validado por profissional competente."
+        )
+        draw_wrapped(d, note, (80, y+65), f_note, gray, W-160, line_gap=7)
+
+        d.text((65, H-70), f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", font=f_note, fill=gray)
+        return page
+
+    def _pdf_evidence_page(self, record, page_num):
+        W, H = 1240, 1754
+        page = Image.new("RGB", (W, H), "white")
+        d = ImageDraw.Draw(page)
+        navy = (13, 41, 68)
+        dark = (25, 35, 45)
+        gray = (90, 105, 118)
+
+        f_title = load_report_font(34, bold=True)
+        f = load_report_font(22, bold=False)
+        f_b = load_report_font(22, bold=True)
+
+        d.rectangle((0, 0, W, 125), fill=navy)
+        d.text((60, 36), f"EVIDENCIA {record.get('numero', page_num)}", font=f_title, fill="white")
+
+        img_path = Path(record.get("arquivo", ""))
+        top = 165
+        max_w, max_h = W-120, 1080
+        if img_path.exists():
+            with Image.open(img_path) as ev:
+                ev = ev.convert("RGB")
+                ev.thumbnail((max_w, max_h), Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS)
+                x = (W - ev.width)//2
+                page.paste(ev, (x, top))
+                bottom = top + ev.height
+        else:
+            d.rectangle((60, top, W-60, top+700), outline=(210,215,220), width=3)
+            d.text((90, top+50), "Imagem de evidencia nao encontrada.", font=f, fill=gray)
+            bottom = top + 700
+
+        y = min(H-430, bottom + 35)
+        d.text((65, y), "DADOS DA EVIDENCIA", font=f_title, fill=navy)
+        y += 55
+
+        dt_txt = str(record.get("capturada_em","")).replace("T"," ")
+        rows = [
+            ("Capturada em", dt_txt),
+            ("IRE / RULA / REBA", f"{record.get('ire',0)}/100   |   {record.get('rula',0)}/7   |   {record.get('reba',0)}/15"),
+            ("Tronco", fmt_angle(record.get("trunk"))),
+            ("Pescoco", fmt_angle(record.get("neck"))),
+            ("Braco D / E", f"{fmt_angle(record.get('shoulder_r'))} / {fmt_angle(record.get('shoulder_l'))}"),
+            ("Joelho D / E", f"{fmt_angle(record.get('knee_r'))} / {fmt_angle(record.get('knee_l'))}"),
+        ]
+        for label, value in rows:
+            d.text((70, y), f"{label}:", font=f_b, fill=dark)
+            d.text((350, y), str(value), font=f, fill=dark)
+            y += 42
+
+        d.text((65, H-60), f"Pagina de evidencia {page_num}", font=f, fill=gray)
+        return page
+
+    def _export_report_android(self, pdf_path):
+        """
+        Copia o PDF para Downloads/NR17 usando MediaStore no Android 10+.
+        Retorna URI/path exportado ou None.
+        """
+        if platform != "android" or not self.pose_analyzer:
+            return None
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            result = str(
+                self.pose_analyzer.exportFileToDownloads(
+                    activity,
+                    str(pdf_path),
+                    pdf_path.name
+                ) or ""
+            )
+            if result.startswith("ERROR:"):
+                return None
+            return result or None
+        except Exception:
+            return None
+
+    def generate_report(self, *_):
+        try:
+            # Se o usuário ainda não tirou evidência, registramos o frame atual.
+            if not self.evidence_records and self.camera and self.camera.texture is not None:
+                try:
+                    self._capture_evidence_file()
+                except Exception:
+                    pass
+
+            snapshot = self._assessment_snapshot()
+            self._save_assessment_json()
+
+            pages = [self._pdf_summary_page(snapshot)]
+            for idx, record in enumerate(self.evidence_records, start=1):
+                pages.append(self._pdf_evidence_page(record, idx))
+
+            pdf_name = f"relatorio_NR17_{self.assessment_id}.pdf"
+            pdf_path = self._assessment_dir() / pdf_name
+
+            pages[0].save(
+                str(pdf_path),
+                "PDF",
+                resolution=150.0,
+                save_all=True,
+                append_images=pages[1:],
+            )
+
+            exported = self._export_report_android(pdf_path)
+            self.last_exported_report = exported or str(pdf_path)
+
+            if exported and exported.startswith("content://"):
+                self.status_text = f"PDF gerado e salvo em Downloads/NR17: {pdf_name}"
+            else:
+                self.status_text = f"PDF gerado: {pdf_path.name}"
+        except Exception as exc:
+            self.status_text = f"Erro ao gerar PDF: {exc}"
+
     def reset_measurement(self, *_):
+        # Preserva a avaliação anterior no armazenamento e inicia uma nova.
+        self._save_assessment_json()
+
         self.total_time = self.invalid_time = self.risk_time = 0.0
         self.trunk_time = self.neck_time = self.arm_time = self.knee_time = 0.0
         self.events = 0
@@ -1058,9 +1616,21 @@ class NR17Screen(BoxLayout):
         self.max_ire = self.max_rula = self.max_reba = 0
         self.cycle_active = False
         self.cycle_count = 0
+        self.cycle_records = []
         self.last_values = None
+        self.last_pose_data = None
         self.last_metrics_tick = time.monotonic()
-        self.status_text = "Medição zerada."
+
+        self.assessment_started_at = datetime.now()
+        self.assessment_id = self.assessment_started_at.strftime("%Y%m%d_%H%M%S")
+        self.assessment_dir = None
+        self.evidence_records = []
+        self.last_exported_report = None
+
+        self._landmark_state = {}
+        self._landmark_streak = {}
+
+        self.status_text = "Nova avaliação iniciada."
         for key, card in self.metrics.items():
             card.set("--")
         if self.overlay:
