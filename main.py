@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.5
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.7
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -32,7 +32,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.7"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -120,6 +120,25 @@ TRUNK_LIMIT = env_float("IRE_TRONCO", 25.0)
 NECK_LIMIT = env_float("IRE_PESCOCO", 25.0)
 ARM_LIMIT = env_float("IRE_BRACO", 60.0)
 KNEE_LIMIT = env_float("IRE_JOELHO", 130.0)
+
+# Evidência automática: mantém somente a postura mais crítica de cada fator.
+AUTO_EVIDENCE_HOLD_S = max(0.25, env_float("AUTO_EVIDENCE_HOLD_S", 0.80))
+AUTO_EVIDENCE_COOLDOWN_S = max(0.50, env_float("AUTO_EVIDENCE_COOLDOWN_S", 2.00))
+AUTO_EVIDENCE_MIN_QUALITY = max(50.0, min(95.0, env_float("AUTO_EVIDENCE_MIN_QUALITY", 60.0)))
+AUTO_EVIDENCE_MIN_COVERAGE = max(35.0, min(95.0, env_float("AUTO_EVIDENCE_MIN_COVERAGE", 55.0)))
+AUTO_EVIDENCE_DELTA = {
+    "trunk": max(0.5, env_float("AUTO_EVIDENCE_DELTA_TRUNK", 2.0)),
+    "neck": max(0.5, env_float("AUTO_EVIDENCE_DELTA_NECK", 2.0)),
+    "arm": max(0.5, env_float("AUTO_EVIDENCE_DELTA_ARM", 3.0)),
+    "knee": max(0.5, env_float("AUTO_EVIDENCE_DELTA_KNEE", 3.0)),
+}
+FACTOR_ORDER = ("trunk", "neck", "arm", "knee")
+FACTOR_LABELS = {
+    "trunk": "TRONCO",
+    "neck": "PESCOCO",
+    "arm": "BRACO",
+    "knee": "JOELHO",
+}
 
 # ------------------------------------------------------------------
 # HELPERS
@@ -735,6 +754,12 @@ class NR17Screen(BoxLayout):
         self.evidence_records = []
         self.last_exported_report = None
 
+        # Evidências automáticas críticas: no máximo 1 por fator.
+        self._factor_high_since = {name: None for name in FACTOR_ORDER}
+        self._factor_best_severity = {}
+        self._auto_evidence_busy = False
+        self._auto_evidence_last_capture = 0.0
+
         self._landmark_state = {}
         self._landmark_streak = {}
         self._frame_worker_busy = False
@@ -906,29 +931,24 @@ class NR17Screen(BoxLayout):
         self.preview_area = FloatLayout()
         left.add_widget(self.preview_area)
 
-        controls = GridLayout(cols=7, size_hint_y=None, height=dp(52), spacing=dp(5))
+        controls = GridLayout(cols=6, size_hint_y=None, height=dp(52), spacing=dp(5))
         controls.add_widget(self._button("INICIAR", self.start_camera, primary=True))
         controls.add_widget(self._button("PARAR", self.stop_camera))
         controls.add_widget(self._button("CICLO", self.toggle_cycle))
-        controls.add_widget(self._button("FOTO +", self.capture_evidence, primary=True))
-        controls.add_widget(self._button("RELATÓRIO", self.generate_report))
+        controls.add_widget(self._button("RELATÓRIO", self.generate_report, primary=True))
         controls.add_widget(self._button("⚙ CÂMERA", self.open_calibration))
         controls.add_widget(self._button("ZERAR", self.reset_measurement))
         left.add_widget(controls)
 
         evidence_bar = Card(
-            orientation="horizontal", size_hint_y=None, height=dp(34),
-            padding=(dp(10), dp(4)), spacing=dp(8)
+            orientation="horizontal", size_hint_y=None, height=dp(38),
+            padding=(dp(10), dp(5)), spacing=dp(8)
         )
         self.evidence_count_lbl = self._label(
-            "EVIDÊNCIAS: 0  ·  Toque em FOTO + para adicionar quantas imagens precisar.",
+            "EVIDÊNCIAS AUTO: 0/4  ·  O app guarda somente a foto mais crítica de cada fator.",
             MUTED, "10sp", True
         )
         evidence_bar.add_widget(self.evidence_count_lbl)
-        remove_btn = self._button("REMOVER ÚLTIMA", self.remove_last_evidence)
-        remove_btn.size_hint_x = None
-        remove_btn.width = dp(150)
-        evidence_bar.add_widget(remove_btn)
         left.add_widget(evidence_bar)
         main.add_widget(left)
 
@@ -1240,6 +1260,11 @@ class NR17Screen(BoxLayout):
             self.overlay.set_pose(landmarks, valid=valid)
         self._update_ui(data, landmarks, values, quality, coverage)
 
+        # Avalia evidências somente depois que o overlay já está atualizado,
+        # garantindo que a foto automática corresponda exatamente à postura atual.
+        if valid:
+            self._evaluate_auto_evidence(values)
+
     def _accumulate(self, v, dt):
         if dt <= 0:
             return
@@ -1344,7 +1369,8 @@ class NR17Screen(BoxLayout):
             "ultimo": v,
             "pico": dict(self.peak_values or v),
             "pico_em": self.peak_at,
-            "evidencias": list(self.evidence_records),
+            "evidencias": list(self._ordered_evidence_records()),
+            "modo_evidencia": "automatica_mais_critica_por_fator",
             "config": {
                 "camera_preview_rotation": self.camera_preview_rotation,
                 "pose_rotation": self.pose_rotation,
@@ -1365,49 +1391,123 @@ class NR17Screen(BoxLayout):
         except Exception:
             return None
 
+    def _ordered_evidence_records(self):
+        order = {name: i for i, name in enumerate(FACTOR_ORDER)}
+        return sorted(
+            list(self.evidence_records),
+            key=lambda r: (order.get(str(r.get("factor", "")), 99), str(r.get("capturada_em", "")))
+        )
+
     def _refresh_evidence_count(self):
         if getattr(self, "evidence_count_lbl", None):
-            n = len(self.evidence_records)
+            records = self._ordered_evidence_records()
+            fatores = [FACTOR_LABELS.get(str(r.get("factor")), str(r.get("factor", "")).upper()) for r in records]
+            detalhe = ", ".join(fatores) if fatores else "aguardando exposicao acima dos limites"
             self.evidence_count_lbl.text = (
-                f"EVIDÊNCIAS: {n}  ·  Cada toque em FOTO + adiciona uma nova imagem ao PDF."
+                f"EVIDÊNCIAS AUTO: {len(records)}/4  ·  {detalhe}"
             )
 
-    def remove_last_evidence(self, *_):
-        if not self.evidence_records:
-            self.status_text = "Não há evidências para remover."
+    def _factor_measurements(self, v):
+        arms = [("D", v.get("shoulder_r")), ("E", v.get("shoulder_l"))]
+        arms = [(side, float(val)) for side, val in arms if val is not None]
+        knees = [("D", v.get("knee_r")), ("E", v.get("knee_l"))]
+        knees = [(side, float(val)) for side, val in knees if val is not None]
+
+        arm_side, arm_value = max(arms, key=lambda x: x[1]) if arms else (None, None)
+        knee_side, knee_value = min(knees, key=lambda x: x[1]) if knees else (None, None)
+
+        return {
+            "trunk": {
+                "value": None if v.get("trunk") is None else float(v.get("trunk")),
+                "limit": float(TRUNK_LIMIT), "side": None, "direction": "high",
+            },
+            "neck": {
+                "value": None if v.get("neck") is None else float(v.get("neck")),
+                "limit": float(NECK_LIMIT), "side": None, "direction": "high",
+            },
+            "arm": {
+                "value": arm_value, "limit": float(ARM_LIMIT), "side": arm_side, "direction": "high",
+            },
+            "knee": {
+                "value": knee_value, "limit": float(KNEE_LIMIT), "side": knee_side, "direction": "low",
+            },
+        }
+
+    def _factor_severity(self, factor, value, limit):
+        if value is None:
+            return None
+        if factor == "knee":
+            return max(0.0, float(limit) - float(value))
+        return max(0.0, float(value) - float(limit))
+
+    def _evaluate_auto_evidence(self, values):
+        if self._auto_evidence_busy or not self._running:
             return
-        record = self.evidence_records.pop()
+        if self.last_quality < AUTO_EVIDENCE_MIN_QUALITY or self.last_coverage < AUTO_EVIDENCE_MIN_COVERAGE:
+            return
+
+        now = time.monotonic()
+        measurements = self._factor_measurements(values)
+        candidates = []
+
+        for factor in FACTOR_ORDER:
+            item = measurements[factor]
+            value = item.get("value")
+            limit = float(item.get("limit", 0))
+            if value is None:
+                self._factor_high_since[factor] = None
+                continue
+
+            critical = value <= limit if item.get("direction") == "low" else value >= limit
+            if not critical:
+                self._factor_high_since[factor] = None
+                continue
+
+            if self._factor_high_since.get(factor) is None:
+                self._factor_high_since[factor] = now
+                continue
+            if (now - self._factor_high_since[factor]) < AUTO_EVIDENCE_HOLD_S:
+                continue
+
+            severity = self._factor_severity(factor, value, limit)
+            previous = self._factor_best_severity.get(factor)
+            delta = AUTO_EVIDENCE_DELTA.get(factor, 2.0)
+            if previous is None or severity >= (previous + delta):
+                candidates.append({
+                    "factor": factor,
+                    "label": FACTOR_LABELS[factor],
+                    "value": float(value),
+                    "limit": limit,
+                    "severity": float(severity),
+                    "side": item.get("side"),
+                })
+
+        if not candidates:
+            return
+        if (now - self._auto_evidence_last_capture) < AUTO_EVIDENCE_COOLDOWN_S:
+            return
+
+        self._auto_evidence_busy = True
         try:
-            path = Path(record.get("arquivo", ""))
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
-        self._refresh_evidence_count()
-        self._save_assessment_json()
-        self.status_text = f"Última evidência removida. Restam {len(self.evidence_records)}."
+            self._capture_auto_evidence(candidates)
+            self._auto_evidence_last_capture = now
+        finally:
+            self._auto_evidence_busy = False
 
-    def _capture_evidence_file(self):
-        """Captura o preview composto exatamente como ele aparece na tela."""
+    def _capture_preview_composed(self):
         if not self.camera or self.camera.texture is None or not self.preview_area:
-            raise RuntimeError("Sem imagem disponível para evidência.")
+            raise RuntimeError("Sem imagem disponivel para evidencia automatica.")
 
-        idx = len(self.evidence_records) + 1
-        captured_at = datetime.now()
-        temp_path = self._evidence_dir() / f"_preview_{idx:03d}.png"
-
+        temp_path = self._evidence_dir() / "_preview_auto.png"
         self._fit_preview()
         if self.overlay:
             self.overlay.redraw()
-
         try:
-            # A câmera e o esqueleto são rasterizados juntos pelo Kivy.
-            # Dessa forma não existe uma segunda rotação/espelhamento no PDF.
             self.preview_area.export_to_png(str(temp_path))
             if not temp_path.exists():
-                raise RuntimeError("Kivy não gerou a captura do preview.")
+                raise RuntimeError("Kivy nao gerou a captura do preview.")
             with Image.open(temp_path) as raw:
-                img = raw.convert("RGB")
+                return raw.convert("RGB")
         finally:
             try:
                 if temp_path.exists():
@@ -1415,59 +1515,105 @@ class NR17Screen(BoxLayout):
             except Exception:
                 pass
 
-        values = dict(self.last_values or {})
-        footer_h = max(118, int(img.height * 0.15))
+    def _render_critical_evidence(self, base_img, candidate, values, captured_at):
+        factor = candidate["factor"]
+        label = candidate["label"]
+        value = float(candidate["value"])
+        limit = float(candidate["limit"])
+        side = candidate.get("side")
+
+        img = base_img.copy()
+        footer_h = max(230, int(img.height * 0.30))
         canvas = Image.new("RGB", (img.width, img.height + footer_h), (8, 20, 34))
         canvas.paste(img, (0, 0))
         draw = ImageDraw.Draw(canvas)
-        f_big = load_report_font(max(18, img.width // 48), bold=True)
-        f_small = load_report_font(max(14, img.width // 68), bold=False)
-        f_tiny = load_report_font(max(12, img.width // 82), bold=False)
-        y0 = img.height + 14
-        draw.text((20, y0),
-            f"NR-17  |  IRE {values.get('ire',0)}/100  |  RULA {values.get('rula',0)}/7  |  REBA {values.get('reba',0)}/15",
-            font=f_big, fill="white")
-        draw.text((20, y0 + 36),
-            f"Tronco {fmt_angle(values.get('trunk'))}  |  Pescoco {fmt_angle(values.get('neck'))}  |  "
-            f"Braco D/E {fmt_angle(values.get('shoulder_r'))}/{fmt_angle(values.get('shoulder_l'))}",
-            font=f_small, fill=(205, 225, 238))
-        draw.text((20, y0 + 68),
-            f"{captured_at.strftime('%d/%m/%Y %H:%M:%S')}  |  Setor: {self.in_setor.text or '-'}  |  "
-            f"Posto: {self.in_posto.text or '-'}  |  Qualidade: {self.last_quality:.0f}%",
-            font=f_tiny, fill=(154, 184, 204))
+        draw.rectangle((0, img.height, img.width, img.height + 8), fill=(35, 158, 183))
 
-        path = self._evidence_dir() / f"evidencia_{idx:03d}.jpg"
+        f_big = load_report_font(max(30, img.width // 34), bold=True)
+        f_mid = load_report_font(max(24, img.width // 46), bold=True)
+        f_small = load_report_font(max(20, img.width // 58), bold=False)
+
+        fator_txt = f"EVIDENCIA CRITICA - {label}"
+        if side:
+            fator_txt += f" {side}"
+        y0 = img.height + 20
+        draw.text((24, y0), fator_txt, font=f_big, fill="white")
+
+        comp = "<=" if factor == "knee" else ">="
+        draw.text(
+            (24, y0 + 52),
+            f"Valor {value:.1f} graus   |   Limite {comp} {limit:.1f} graus   |   "
+            f"IRE {values.get('ire',0)}/100   RULA {values.get('rula',0)}/7   REBA {values.get('reba',0)}/15",
+            font=f_mid, fill=(213, 232, 242),
+        )
+        draw.text(
+            (24, y0 + 100),
+            f"Tronco {fmt_angle(values.get('trunk'))}   |   Pescoco {fmt_angle(values.get('neck'))}   |   "
+            f"Braco D/E {fmt_angle(values.get('shoulder_r'))} / {fmt_angle(values.get('shoulder_l'))}",
+            font=f_small, fill=(170, 201, 218),
+        )
+        draw.text(
+            (24, y0 + 140),
+            f"{captured_at.strftime('%d/%m/%Y %H:%M:%S')}   |   Qualidade {self.last_quality:.0f}%   |   "
+            f"Cobertura {self.last_coverage:.0f}%",
+            font=f_small, fill=(170, 201, 218),
+        )
+
+        path = self._evidence_dir() / f"evidencia_critica_{factor}.jpg"
         canvas.save(str(path), "JPEG", quality=95, subsampling=0)
-        record = {
-            "numero": idx, "arquivo": str(path),
-            "capturada_em": captured_at.isoformat(timespec="seconds"),
-            "ire": int(values.get("ire", 0) or 0),
-            "rula": int(values.get("rula", 0) or 0),
-            "reba": int(values.get("reba", 0) or 0),
-            "trunk": values.get("trunk"), "neck": values.get("neck"),
-            "shoulder_r": values.get("shoulder_r"), "shoulder_l": values.get("shoulder_l"),
-            "elbow_r": values.get("elbow_r"), "elbow_l": values.get("elbow_l"),
-            "knee_r": values.get("knee_r"), "knee_l": values.get("knee_l"),
-            "quality": round(float(self.last_quality or 0), 1),
-            "coverage": round(float(self.last_coverage or 0), 1),
-            "camera_preview_rotation": int(self.camera_preview_rotation),
-            "pose_rotation": int(self.pose_rotation),
-            "mirror_x": bool(self.mirror_x), "mirror_y": bool(self.mirror_y),
-        }
-        self.evidence_records.append(record)
+        return path
+
+    def _capture_auto_evidence(self, candidates):
+        if not candidates:
+            return
+        base_img = self._capture_preview_composed()
+        values = dict(self.last_values or {})
+        captured_at = datetime.now()
+
+        for candidate in candidates:
+            factor = candidate["factor"]
+            path = self._render_critical_evidence(base_img, candidate, values, captured_at)
+            record = {
+                "numero": FACTOR_ORDER.index(factor) + 1,
+                "arquivo": str(path),
+                "capturada_em": captured_at.isoformat(timespec="seconds"),
+                "auto": True,
+                "factor": factor,
+                "factor_label": candidate["label"],
+                "factor_value": round(float(candidate["value"]), 2),
+                "factor_limit": round(float(candidate["limit"]), 2),
+                "factor_severity": round(float(candidate["severity"]), 2),
+                "factor_side": candidate.get("side"),
+                "ire": int(values.get("ire", 0) or 0),
+                "rula": int(values.get("rula", 0) or 0),
+                "reba": int(values.get("reba", 0) or 0),
+                "trunk": values.get("trunk"), "neck": values.get("neck"),
+                "shoulder_r": values.get("shoulder_r"), "shoulder_l": values.get("shoulder_l"),
+                "elbow_r": values.get("elbow_r"), "elbow_l": values.get("elbow_l"),
+                "knee_r": values.get("knee_r"), "knee_l": values.get("knee_l"),
+                "quality": round(float(self.last_quality or 0), 1),
+                "coverage": round(float(self.last_coverage or 0), 1),
+                "camera_preview_rotation": int(self.camera_preview_rotation),
+                "pose_rotation": int(self.pose_rotation),
+                "mirror_x": bool(self.mirror_x), "mirror_y": bool(self.mirror_y),
+            }
+
+            replaced = False
+            for i, old in enumerate(self.evidence_records):
+                if old.get("factor") == factor:
+                    self.evidence_records[i] = record
+                    replaced = True
+                    break
+            if not replaced:
+                self.evidence_records.append(record)
+
+            self._factor_best_severity[factor] = float(candidate["severity"])
+
+        self.evidence_records = self._ordered_evidence_records()
         self._refresh_evidence_count()
         self._save_assessment_json()
-        return path, record
-
-    def capture_evidence(self, *_):
-        try:
-            path, _record = self._capture_evidence_file()
-            self.status_text = (
-                f"Foto {len(self.evidence_records)} adicionada. "
-                f"O PDF incluirá todas as {len(self.evidence_records)} evidências."
-            )
-        except Exception as exc:
-            self.status_text = f"Erro ao salvar evidência: {exc}"
+        nomes = ", ".join(c["label"] for c in candidates)
+        self.status_text = f"Evidencia critica atualizada automaticamente: {nomes}."
 
     # --------------------------- PDF ---------------------------
     def _risk_level_report(self, ire):
@@ -1480,152 +1626,379 @@ class NR17Screen(BoxLayout):
             return "ATENCAO", (226, 169, 45), "Acompanhar a exposicao e revisar oportunidades de melhoria."
         return "BAIXO", (46, 160, 104), "Baixa exposicao visual no periodo analisado."
 
-    def _pdf_metric_card(self, d, box, label, value, accent, fonts):
+    def _pdf_metric_card(self, d, box, label, value, accent, fonts, note=None):
         x1, y1, x2, y2 = box
-        d.rounded_rectangle(box, radius=18, fill=(247, 250, 252), outline=(216, 226, 234), width=2)
-        d.rectangle((x1, y1, x1+8, y2), fill=accent)
-        d.text((x1+24, y1+20), label, font=fonts["small_b"], fill=(92, 109, 124))
-        d.text((x1+24, y1+58), str(value), font=fonts["metric"], fill=(18, 50, 78))
+        d.rounded_rectangle(box, radius=24, fill=(255, 255, 255), outline=(211, 223, 232), width=3)
+        d.rounded_rectangle((x1, y1, x1 + 12, y2), radius=6, fill=accent)
+        d.text((x1 + 34, y1 + 24), str(label), font=fonts["label"], fill=(92, 109, 124))
+        d.text((x1 + 34, y1 + 72), str(value), font=fonts["metric"], fill=(17, 48, 76))
+        if note:
+            d.text((x1 + 34, y2 - 40), str(note), font=fonts["tiny"], fill=(111, 127, 141))
 
-    def _pdf_exposure_bar(self, d, y, label, pct, fonts):
+    def _pdf_exposure_bar(self, d, y, label, pct, fonts, x1=86, x2=1568):
         pct = float(pct or 0)
-        x_label, x_bar, bar_w, bar_h = 75, 330, 805, 28
-        d.text((x_label, y-4), label, font=fonts["body_b"], fill=(36, 51, 64))
-        d.rounded_rectangle((x_bar, y, x_bar+bar_w, y+bar_h), radius=14, fill=(230, 236, 241))
-        fill_w = bar_w * clamp(pct/100.0, 0, 1)
-        col = (214, 52, 71) if pct >= 70 else (238, 117, 37) if pct >= 40 else (226, 169, 45) if pct >= 20 else (35, 158, 183)
-        if fill_w > 1:
-            d.rounded_rectangle((x_bar, y, x_bar+fill_w, y+bar_h), radius=14, fill=col)
+        d.text((x1, y), str(label), font=fonts["body_b"], fill=(34, 48, 61))
         pct_txt = f"{pct:.1f}%"
         try:
-            bb = d.textbbox((0, 0), pct_txt, font=fonts["body_b"]); tw = bb[2]-bb[0]
+            bb = d.textbbox((0, 0), pct_txt, font=fonts["body_b"])
+            tw = bb[2] - bb[0]
         except Exception:
-            tw = 70
-        d.text((1140-tw, y-4), pct_txt, font=fonts["body_b"], fill=(36, 51, 64))
+            tw = 100
+        d.text((x2 - tw, y), pct_txt, font=fonts["body_b"], fill=(34, 48, 61))
+        by = y + 48
+        bar_h = 42
+        d.rounded_rectangle((x1, by, x2, by + bar_h), radius=21, fill=(226, 234, 240))
+        fill_w = (x2 - x1) * clamp(pct / 100.0, 0, 1)
+        col = (
+            (214, 52, 71) if pct >= 70 else
+            (238, 117, 37) if pct >= 40 else
+            (226, 169, 45) if pct >= 20 else
+            (35, 158, 183)
+        )
+        if fill_w > 2:
+            d.rounded_rectangle((x1, by, x1 + fill_w, by + bar_h), radius=21, fill=col)
+
+    def _pdf_field(self, d, box, label, value, fonts, accent=(35, 158, 183)):
+        x1, y1, x2, y2 = box
+        d.rounded_rectangle(box, radius=20, fill=(250, 252, 253), outline=(215, 225, 233), width=2)
+        d.rectangle((x1, y1, x1 + 7, y2), fill=accent)
+        d.text((x1 + 26, y1 + 18), str(label).upper(), font=fonts["label"], fill=(101, 116, 130))
+        value = str(value or "-")
+        draw_wrapped(d, value, (x1 + 26, y1 + 60), fonts["body_b"], (30, 44, 57), x2 - x1 - 52, line_gap=6)
 
     def _pdf_summary_page(self, snapshot):
-        W, H = 1240, 1754
+        """Pagina 1 - resumo executivo, com tipografia grande e leitura a distancia."""
+        W, H = 1654, 2339  # A4 a 200 dpi
         page = Image.new("RGB", (W, H), (246, 249, 251))
         d = ImageDraw.Draw(page)
-        navy=(10,38,64); navy2=(18,62,96); cyan=(35,158,183); dark=(31,45,58)
-        gray=(96,113,128); line=(215,225,233); white=(255,255,255)
-        fonts={
-            "title":load_report_font(38,True), "subtitle":load_report_font(22),
-            "section":load_report_font(25,True), "body":load_report_font(21),
-            "body_b":load_report_font(21,True), "small":load_report_font(17),
-            "small_b":load_report_font(17,True), "metric":load_report_font(38,True),
-            "risk":load_report_font(30,True),
+
+        navy = (10, 38, 64)
+        navy2 = (18, 62, 96)
+        cyan = (35, 158, 183)
+        dark = (31, 45, 58)
+        gray = (96, 113, 128)
+        line = (215, 225, 233)
+        white = (255, 255, 255)
+
+        fonts = {
+            "title": load_report_font(68, True),
+            "subtitle": load_report_font(34, False),
+            "section": load_report_font(46, True),
+            "body": load_report_font(36, False),
+            "body_b": load_report_font(36, True),
+            "label": load_report_font(28, True),
+            "small": load_report_font(28, False),
+            "small_b": load_report_font(28, True),
+            "tiny": load_report_font(24, False),
+            "metric": load_report_font(66, True),
+            "risk": load_report_font(48, True),
         }
-        d.rectangle((0,0,W,205),fill=navy); d.rectangle((0,198,W,205),fill=cyan)
-        d.text((62,45),"NR-17 | RELATORIO ERGONOMICO POR VISAO",font=fonts["title"],fill=white)
-        d.text((65,108),"Triagem postural assistida por visao computacional",font=fonts["subtitle"],fill=(189,215,230))
-        d.text((855,113),f"Avaliacao: {snapshot.get('assessment_id','-')}",font=fonts["small_b"],fill=(189,215,230))
 
-        y=238
-        d.rounded_rectangle((58,y,1182,y+178),radius=20,fill=white,outline=line,width=2)
-        d.text((82,y+18),"IDENTIFICACAO",font=fonts["section"],fill=navy)
-        fields=[
-            ("Setor",snapshot.get("setor") or "-"),("Operacao / Posto",snapshot.get("posto") or "-"),("Colaborador",snapshot.get("colaborador") or "-"),
-            ("Inicio",str(snapshot.get("inicio") or "-").replace("T"," ")),("Tempo valido",fmt_seconds(snapshot.get("tempo_valido_s",0))),("Evidencias",str(len(snapshot.get("evidencias",[])))),
+        d.rectangle((0, 0, W, 270), fill=navy)
+        d.rectangle((0, 260, W, 270), fill=cyan)
+        d.text((82, 48), "NR-17 | RELATORIO ERGONOMICO", font=fonts["title"], fill=white)
+        d.text((86, 132), "Triagem postural assistida por visao computacional", font=fonts["subtitle"], fill=(196, 219, 232))
+        d.text((86, 192), f"Avaliacao {snapshot.get('assessment_id', '-')}", font=fonts["small_b"], fill=(160, 198, 219))
+
+        y = 320
+        d.text((82, y), "IDENTIFICACAO", font=fonts["section"], fill=navy)
+        y += 70
+        col_gap = 26
+        col_w = (W - 164 - col_gap) // 2
+        x_left = 82
+        x_right = 82 + col_w + col_gap
+        row_h = 138
+        self._pdf_field(d, (x_left, y, x_left + col_w, y + row_h), "Setor", snapshot.get("setor") or "-", fonts)
+        self._pdf_field(d, (x_right, y, x_right + col_w, y + row_h), "Operacao / Posto", snapshot.get("posto") or "-", fonts)
+        y += row_h + 22
+        self._pdf_field(d, (x_left, y, x_left + col_w, y + row_h), "Colaborador", snapshot.get("colaborador") or "-", fonts)
+        self._pdf_field(d, (x_right, y, x_right + col_w, y + row_h), "Inicio", str(snapshot.get("inicio") or "-").replace("T", " "), fonts)
+
+        y += row_h + 28
+        chips = [
+            ("TEMPO VALIDO", fmt_seconds(snapshot.get("tempo_valido_s", 0))),
+            ("EVIDENCIAS", str(len(snapshot.get("evidencias", [])))),
+            ("EVENTOS", str(snapshot.get("eventos", 0))),
+            ("CICLOS", str(len(snapshot.get("ciclos", [])))),
         ]
-        xs=[82,455,825]
-        for i,(lab,val) in enumerate(fields):
-            row=0 if i<3 else 1; col=i if i<3 else i-3
-            x=xs[col]; yy=y+58+row*55
-            d.text((x,yy),str(lab).upper(),font=fonts["small_b"],fill=gray)
-            d.text((x,yy+24),str(val),font=fonts["body"],fill=dark)
+        chip_gap = 18
+        chip_w = int((W - 164 - chip_gap * 3) / 4)
+        for i, (lab, val) in enumerate(chips):
+            x = 82 + i * (chip_w + chip_gap)
+            d.rounded_rectangle((x, y, x + chip_w, y + 105), radius=18, fill=(236, 243, 247))
+            d.text((x + 20, y + 15), lab, font=fonts["label"], fill=gray)
+            d.text((x + 20, y + 55), val, font=fonts["body_b"], fill=navy2)
 
-        y=448; d.text((62,y),"RESUMO EXECUTIVO DE RISCO",font=fonts["section"],fill=navy); y+=45
-        card_w,gap=258,20
-        metrics=[("IRE MAX",f"{snapshot.get('max_ire',0)}/100",cyan),("RULA MAX",f"{snapshot.get('max_rula',0)}/7",(87,111,169)),("REBA MAX",f"{snapshot.get('max_reba',0)}/15",(117,88,165)),("EXPOSICAO",f"{snapshot.get('exposicao_total_pct',0):.1f}%",navy2)]
-        for i,item in enumerate(metrics):
-            x=62+i*(card_w+gap); self._pdf_metric_card(d,(x,y,x+card_w,y+130),*item,fonts)
-        level,level_color,level_desc=self._risk_level_report(snapshot.get("max_ire",0)); y+=155
-        d.rounded_rectangle((62,y,1178,y+92),radius=20,fill=white,outline=level_color,width=3)
-        d.rounded_rectangle((82,y+18,340,y+72),radius=14,fill=level_color)
-        d.text((103,y+31),f"RISCO {level}",font=fonts["risk"],fill=white)
-        d.text((370,y+23),level_desc,font=fonts["body_b"],fill=dark)
-        d.text((370,y+54),"Resultado de triagem visual - validar no contexto da AEP/AET.",font=fonts["small"],fill=gray)
-
-        y+=130; d.text((62,y),"EXPOSICAO CORPORAL NO PERIODO",font=fonts["section"],fill=navy); y+=50
-        for lab,pct in [("Tronco",snapshot.get("exposicao_tronco_pct",0)),("Pescoco",snapshot.get("exposicao_pescoco_pct",0)),("Braco elevado",snapshot.get("exposicao_braco_pct",0)),("Joelho / flexao",snapshot.get("exposicao_joelho_pct",0))]:
-            self._pdf_exposure_bar(d,y,lab,pct,fonts); y+=58
-
-        y+=12; peak=snapshot.get("pico") or snapshot.get("ultimo") or {}
-        d.text((62,y),"POSTURA DE MAIOR IRE",font=fonts["section"],fill=navy)
-        if snapshot.get("pico_em"):
-            d.text((400,y+4),str(snapshot.get("pico_em")).replace("T"," "),font=fonts["small"],fill=gray)
-        y+=48; d.rounded_rectangle((62,y,1178,y+238),radius=20,fill=white,outline=line,width=2)
-        peak_items=[
-            ("TRONCO",fmt_angle(peak.get("trunk")),f"Limite IRE: {TRUNK_LIMIT:.0f}°"),
-            ("PESCOCO",fmt_angle(peak.get("neck")),f"Limite IRE: {NECK_LIMIT:.0f}°"),
-            ("BRACO D / E",f"{fmt_angle(peak.get('shoulder_r'))} / {fmt_angle(peak.get('shoulder_l'))}",f"Limite IRE: {ARM_LIMIT:.0f}°"),
-            ("JOELHO D / E",f"{fmt_angle(peak.get('knee_r'))} / {fmt_angle(peak.get('knee_l'))}",f"Critico abaixo de {KNEE_LIMIT:.0f}°"),
+        y += 160
+        d.text((82, y), "RESUMO EXECUTIVO", font=fonts["section"], fill=navy)
+        y += 70
+        card_gap = 20
+        card_w = int((W - 164 - card_gap * 3) / 4)
+        metrics = [
+            ("IRE MAX", f"{snapshot.get('max_ire', 0)}/100", cyan),
+            ("RULA MAX", f"{snapshot.get('max_rula', 0)}/7", (87, 111, 169)),
+            ("REBA MAX", f"{snapshot.get('max_reba', 0)}/15", (117, 88, 165)),
+            ("EXPOSICAO", f"{snapshot.get('exposicao_total_pct', 0):.1f}%", navy2),
         ]
-        cell_w=538; cell_h=92
-        for i,(lab,val,note) in enumerate(peak_items):
-            col=i%2; row=i//2; x=84+col*548; yy=y+24+row*96
-            if col: d.line((620,y+20,620,y+205),fill=line,width=2)
-            if row and col==0: d.line((82,y+116,1158,y+116),fill=line,width=2)
-            d.text((x,yy),lab,font=fonts["small_b"],fill=gray)
-            d.text((x+185,yy-4),val,font=fonts["metric"],fill=navy2)
-            d.text((x,yy+48),note,font=fonts["small"],fill=gray)
-        d.text((84,y+208),f"Eventos de risco: {snapshot.get('eventos',0)}   |   Ciclos fechados: {len(snapshot.get('ciclos',[]))}",font=fonts["small_b"],fill=gray)
+        for i, item in enumerate(metrics):
+            x = 82 + i * (card_w + card_gap)
+            self._pdf_metric_card(d, (x, y, x + card_w, y + 190), *item, fonts)
 
-        y+=270; d.text((62,y),f"EVIDENCIAS REGISTRADAS  |  {len(snapshot.get('evidencias',[]))}",font=fonts["section"],fill=navy); y+=42
-        records=list(snapshot.get("evidencias",[]))[:3]
-        if records:
-            thumb_w,thumb_h,gap=350,155,18
-            for i,rec in enumerate(records):
-                x=62+i*(thumb_w+gap); d.rounded_rectangle((x,y,x+thumb_w,y+thumb_h),radius=15,fill=white,outline=line,width=2)
-                p=Path(rec.get("arquivo",""))
-                if p.exists():
-                    try:
-                        with Image.open(p) as ev:
-                            ev=ev.convert("RGB"); res=Image.Resampling.LANCZOS if hasattr(Image,"Resampling") else Image.LANCZOS; ev.thumbnail((thumb_w-16,thumb_h-38),res)
-                            page.paste(ev,(x+(thumb_w-ev.width)//2,y+8))
-                    except Exception: pass
-                d.text((x+10,y+thumb_h-27),f"Foto {rec.get('numero',i+1)}  |  IRE {rec.get('ire',0)}",font=fonts["small_b"],fill=dark)
-            if len(snapshot.get("evidencias",[]))>3:
-                d.text((62,y+thumb_h+10),f"+ {len(snapshot.get('evidencias',[]))-3} evidencias nas paginas seguintes",font=fonts["small"],fill=gray)
-        else:
-            d.text((75,y+25),"Nenhuma evidencia fotografica registrada.",font=fonts["body"],fill=gray)
+        y += 225
+        level, level_color, level_desc = self._risk_level_report(snapshot.get("max_ire", 0))
+        d.rounded_rectangle((82, y, 1572, y + 165), radius=24, fill=white, outline=level_color, width=4)
+        d.rounded_rectangle((108, y + 28, 470, y + 136), radius=18, fill=level_color)
+        d.text((142, y + 53), f"RISCO {level}", font=fonts["risk"], fill=white)
+        draw_wrapped(d, level_desc, (510, y + 30), fonts["body_b"], dark, 1000, line_gap=8)
+        d.text((510, y + 105), "Resultado de triagem visual - validar no contexto da AEP/AET.", font=fonts["small"], fill=gray)
 
-        d.line((62,1680,1178,1680),fill=line,width=2)
-        d.text((62,1695),"NR-17 Visao 0.1.5  |  Apoio a AEP/AET - nao substitui avaliacao ergonomica profissional.",font=fonts["small"],fill=gray)
-        d.text((925,1695),datetime.now().strftime("%d/%m/%Y %H:%M"),font=fonts["small"],fill=gray)
+        y += 225
+        d.text((82, y), "EXPOSICAO CORPORAL NO PERIODO", font=fonts["section"], fill=navy)
+        y += 72
+        for lab, pct in [
+            ("Tronco", snapshot.get("exposicao_tronco_pct", 0)),
+            ("Pescoco", snapshot.get("exposicao_pescoco_pct", 0)),
+            ("Braco elevado", snapshot.get("exposicao_braco_pct", 0)),
+            ("Joelho / flexao", snapshot.get("exposicao_joelho_pct", 0)),
+        ]:
+            self._pdf_exposure_bar(d, y, lab, pct, fonts)
+            y += 125
+
+        # Nota metodologica curta - texto ainda grande.
+        y += 8
+        d.rounded_rectangle((82, y, 1572, y + 175), radius=22, fill=(236, 243, 247), outline=line, width=2)
+        d.text((108, y + 22), "LEITURA DO RESULTADO", font=fonts["label"], fill=navy2)
+        note = (
+            "IRE, RULA e REBA sao calculos assistidos por visao computacional. "
+            "O resultado apoia a AEP/AET e deve ser validado considerando carga, forca, pega, repetitividade e contexto real da atividade."
+        )
+        draw_wrapped(d, note, (108, y + 62), fonts["small"], gray, 1400, line_gap=7)
+
+        d.line((82, 2260, 1572, 2260), fill=line, width=2)
+        d.text((82, 2280), "Pagina 1 | Resumo executivo", font=fonts["tiny"], fill=gray)
+        d.text((1045, 2280), "Detalhe postural na pagina 2", font=fonts["tiny"], fill=navy2)
         return page
 
-    def _pdf_evidence_page(self, record, page_num, total_pages):
-        W,H=1240,1754; page=Image.new("RGB",(W,H),(246,249,251)); d=ImageDraw.Draw(page)
-        navy=(10,38,64); cyan=(35,158,183); dark=(31,45,58); gray=(96,113,128); line=(215,225,233); white=(255,255,255)
-        fonts={"title":load_report_font(38,True),"section":load_report_font(24,True),"body":load_report_font(21),"body_b":load_report_font(21,True),"small":load_report_font(17),"small_b":load_report_font(17,True),"metric":load_report_font(34,True)}
-        d.rectangle((0,0,W,155),fill=navy); d.rectangle((0,148,W,155),fill=cyan)
-        d.text((62,42),f"EVIDENCIA {int(record.get('numero',page_num)):02d}",font=fonts["title"],fill=white)
-        d.text((62,102),str(record.get("capturada_em","")).replace("T"," "),font=fonts["small"],fill=(189,215,230))
-        d.text((980,70),f"Pagina {page_num+1}/{total_pages}",font=fonts["small_b"],fill=white)
-        top=190; d.rounded_rectangle((58,top,1182,1125),radius=20,fill=white,outline=line,width=2)
-        p=Path(record.get("arquivo",""))
+    def _pdf_posture_page(self, snapshot, total_pages):
+        """Pagina 2 - angulos, limites e configuracao, sem apertar informacao na primeira pagina."""
+        W, H = 1654, 2339
+        page = Image.new("RGB", (W, H), (246, 249, 251))
+        d = ImageDraw.Draw(page)
+        navy = (10, 38, 64)
+        navy2 = (18, 62, 96)
+        cyan = (35, 158, 183)
+        dark = (31, 45, 58)
+        gray = (96, 113, 128)
+        line = (215, 225, 233)
+        white = (255, 255, 255)
+
+        fonts = {
+            "title": load_report_font(64, True),
+            "section": load_report_font(44, True),
+            "body": load_report_font(35, False),
+            "body_b": load_report_font(35, True),
+            "label": load_report_font(28, True),
+            "small": load_report_font(28, False),
+            "small_b": load_report_font(28, True),
+            "tiny": load_report_font(24, False),
+            "angle": load_report_font(58, True),
+        }
+
+        d.rectangle((0, 0, W, 210), fill=navy)
+        d.rectangle((0, 200, W, 210), fill=cyan)
+        d.text((82, 48), "DETALHE POSTURAL", font=fonts["title"], fill=white)
+        d.text((86, 132), f"Avaliacao {snapshot.get('assessment_id', '-')}", font=fonts["small_b"], fill=(189, 215, 230))
+        d.text((1355, 96), f"2/{total_pages}", font=fonts["small_b"], fill=white)
+
+        peak = snapshot.get("pico") or snapshot.get("ultimo") or {}
+        y = 270
+        d.text((82, y), "POSTURA DE MAIOR IRE", font=fonts["section"], fill=navy)
+        if snapshot.get("pico_em"):
+            d.text((820, y + 10), str(snapshot.get("pico_em")).replace("T", " "), font=fonts["small"], fill=gray)
+        y += 78
+
+        box_h = 530
+        d.rounded_rectangle((82, y, 1572, y + box_h), radius=24, fill=white, outline=line, width=3)
+        d.line((827, y + 24, 827, y + box_h - 24), fill=line, width=3)
+        d.line((106, y + 265, 1548, y + 265), fill=line, width=3)
+        peak_items = [
+            ("TRONCO", fmt_angle(peak.get("trunk")), f"Limite de exposicao: {TRUNK_LIMIT:.0f} graus"),
+            ("PESCOCO", fmt_angle(peak.get("neck")), f"Limite de exposicao: {NECK_LIMIT:.0f} graus"),
+            ("BRACO D / E", f"{fmt_angle(peak.get('shoulder_r'))} / {fmt_angle(peak.get('shoulder_l'))}", f"Limite de exposicao: {ARM_LIMIT:.0f} graus"),
+            ("JOELHO D / E", f"{fmt_angle(peak.get('knee_r'))} / {fmt_angle(peak.get('knee_l'))}", f"Exposicao quando abaixo de {KNEE_LIMIT:.0f} graus"),
+        ]
+        for i, (lab, val, note) in enumerate(peak_items):
+            col = i % 2
+            row = i // 2
+            x = 118 + col * 745
+            yy = y + 52 + row * 265
+            d.text((x, yy), lab, font=fonts["label"], fill=gray)
+            d.text((x, yy + 50), val, font=fonts["angle"], fill=navy2)
+            d.text((x, yy + 132), note, font=fonts["small"], fill=gray)
+
+        y += box_h + 80
+        d.text((82, y), "REFERENCIAS DE EXPOSICAO CONFIGURADAS", font=fonts["section"], fill=navy)
+        y += 72
+        refs = [
+            ("Tronco", f">= {TRUNK_LIMIT:.0f} graus"),
+            ("Pescoco", f">= {NECK_LIMIT:.0f} graus"),
+            ("Braco", f">= {ARM_LIMIT:.0f} graus"),
+            ("Joelho", f"<= {KNEE_LIMIT:.0f} graus"),
+        ]
+        ref_gap = 20
+        ref_w = int((W - 164 - ref_gap * 3) / 4)
+        for i, (lab, val) in enumerate(refs):
+            x = 82 + i * (ref_w + ref_gap)
+            d.rounded_rectangle((x, y, x + ref_w, y + 150), radius=20, fill=white, outline=line, width=2)
+            d.text((x + 24, y + 22), lab.upper(), font=fonts["label"], fill=gray)
+            d.text((x + 24, y + 72), val, font=fonts["body_b"], fill=navy2)
+
+        y += 220
+        d.text((82, y), "CONFIGURACAO DA CAPTURA", font=fonts["section"], fill=navy)
+        y += 72
+        cfg = snapshot.get("config") or {}
+        cfg_lines = [
+            f"Camera: {cfg.get('camera_preview_rotation', '-')} graus     Pose: {cfg.get('pose_rotation', '-')} graus",
+            f"Espelho X: {'SIM' if cfg.get('mirror_x') else 'NAO'}     Espelho Y: {'SIM' if cfg.get('mirror_y') else 'NAO'}",
+            f"Confianca minima: {float(cfg.get('pose_min_confidence', 0) or 0):.2f}     Confianca de angulos: {float(cfg.get('angle_min_confidence', 0) or 0):.2f}",
+        ]
+        d.rounded_rectangle((82, y, 1572, y + 250), radius=22, fill=(236, 243, 247), outline=line, width=2)
+        yy = y + 32
+        for line_txt in cfg_lines:
+            d.text((112, yy), line_txt, font=fonts["body"], fill=dark)
+            yy += 66
+
+        y += 330
+        evidencias = list(snapshot.get("evidencias", []))
+        evidence_count = len(evidencias)
+        fatores = ", ".join(str(r.get("factor_label") or r.get("factor") or "").upper() for r in evidencias) or "NENHUM FATOR ACIMA DO LIMITE"
+        d.rounded_rectangle((82, y, 1572, y + 180), radius=22, fill=white, outline=cyan, width=3)
+        d.text((112, y + 22), f"EVIDENCIAS CRITICAS AUTOMATICAS: {evidence_count}/4", font=fonts["section"], fill=navy)
+        d.text((112, y + 91), f"Fatores documentados: {fatores}", font=fonts["small_b"], fill=navy2)
+        d.text((112, y + 133), "O sistema mantem somente a postura mais critica observada de cada fator.", font=fonts["small"], fill=gray)
+
+        d.line((82, 2260, 1572, 2260), fill=line, width=2)
+        d.text((82, 2280), "Pagina 2 | Detalhe postural", font=fonts["tiny"], fill=gray)
+        d.text((1070, 2280), f"Total do relatorio: {total_pages} paginas", font=fonts["tiny"], fill=navy2)
+        return page
+
+    def _pdf_evidence_page(self, record, evidence_index, page_number, total_pages):
+        W, H = 1654, 2339
+        page = Image.new("RGB", (W, H), (246, 249, 251))
+        d = ImageDraw.Draw(page)
+        navy = (10, 38, 64)
+        navy2 = (18, 62, 96)
+        cyan = (35, 158, 183)
+        dark = (31, 45, 58)
+        gray = (96, 113, 128)
+        line = (215, 225, 233)
+        white = (255, 255, 255)
+
+        fonts = {
+            "title": load_report_font(64, True),
+            "section": load_report_font(42, True),
+            "body": load_report_font(34, False),
+            "body_b": load_report_font(34, True),
+            "label": load_report_font(27, True),
+            "small": load_report_font(27, False),
+            "small_b": load_report_font(27, True),
+            "tiny": load_report_font(23, False),
+            "metric": load_report_font(58, True),
+            "angle": load_report_font(46, True),
+        }
+
+        d.rectangle((0, 0, W, 190), fill=navy)
+        d.rectangle((0, 180, W, 190), fill=cyan)
+        factor_label = str(record.get("factor_label") or record.get("factor") or f"EVIDENCIA {evidence_index}").upper()
+        side = str(record.get("factor_side") or "").strip()
+        title_txt = f"EVIDENCIA CRITICA | {factor_label}" + (f" {side}" if side else "")
+        d.text((82, 44), title_txt, font=fonts["title"], fill=white)
+        value = record.get("factor_value")
+        limit = record.get("factor_limit")
+        factor = str(record.get("factor") or "")
+        comp = "<=" if factor == "knee" else ">="
+        sub_txt = str(record.get("capturada_em", "")).replace("T", " ")
+        if value is not None and limit is not None:
+            sub_txt += f"   |   Pico {float(value):.1f} graus   |   Limite {comp} {float(limit):.1f} graus"
+        d.text((86, 122), sub_txt, font=fonts["small"], fill=(189, 215, 230))
+        page_txt = f"Pagina {page_number}/{total_pages}"
+        try:
+            bb = d.textbbox((0, 0), page_txt, font=fonts["small_b"])
+            tw = bb[2] - bb[0]
+        except Exception:
+            tw = 190
+        d.text((W - 82 - tw, 78), page_txt, font=fonts["small_b"], fill=white)
+
+        # A imagem continua sendo o elemento principal da pagina.
+        img_top = 235
+        img_bottom = 1360
+        d.rounded_rectangle((70, img_top, 1584, img_bottom), radius=24, fill=white, outline=line, width=3)
+        p = Path(record.get("arquivo", ""))
         if p.exists():
             try:
                 with Image.open(p) as ev:
-                    ev=ev.convert("RGB"); res=Image.Resampling.LANCZOS if hasattr(Image,"Resampling") else Image.LANCZOS; ev.thumbnail((1084,895),res)
-                    page.paste(ev,((W-ev.width)//2,top+(915-ev.height)//2))
+                    ev = ev.convert("RGB")
+                    res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                    ev.thumbnail((1460, 1060), res)
+                    page.paste(ev, ((W - ev.width) // 2, img_top + (img_bottom - img_top - ev.height) // 2))
             except Exception:
-                d.text((95,top+60),"Nao foi possivel carregar a imagem da evidencia.",font=fonts["body"],fill=gray)
+                d.text((110, img_top + 70), "Nao foi possivel carregar a imagem da evidencia.", font=fonts["body"], fill=gray)
         else:
-            d.text((95,top+60),"Imagem da evidencia nao encontrada.",font=fonts["body"],fill=gray)
-        y=1160; d.text((62,y),"INDICADORES DA CAPTURA",font=fonts["section"],fill=navy); y+=42
-        cards=[("IRE",f"{record.get('ire',0)}/100",cyan),("RULA",f"{record.get('rula',0)}/7",(87,111,169)),("REBA",f"{record.get('reba',0)}/15",(117,88,165)),("QUALIDADE",f"{float(record.get('quality',0) or 0):.0f}%",navy)]
-        cw,gap=258,20
-        for i,item in enumerate(cards):
-            x=62+i*(cw+gap); self._pdf_metric_card(d,(x,y,x+cw,y+118),*item,fonts)
-        y+=150; d.rounded_rectangle((62,y,1178,y+220),radius=20,fill=white,outline=line,width=2); d.text((84,y+18),"ANGULOS E CONTEXTO",font=fonts["section"],fill=navy)
-        rows=[("Tronco",fmt_angle(record.get("trunk")),"Pescoco",fmt_angle(record.get("neck"))),("Braco D / E",f"{fmt_angle(record.get('shoulder_r'))} / {fmt_angle(record.get('shoulder_l'))}","Joelho D / E",f"{fmt_angle(record.get('knee_r'))} / {fmt_angle(record.get('knee_l'))}"),("Cobertura",f"{float(record.get('coverage',0) or 0):.0f}%","Calibracao",f"Cam {record.get('camera_preview_rotation','-')}° | Pose {record.get('pose_rotation','-')}°")]
-        yy=y+68
-        for l1,v1,l2,v2 in rows:
-            d.text((85,yy),f"{l1}:",font=fonts["body_b"],fill=gray); d.text((245,yy),str(v1),font=fonts["body"],fill=dark); d.text((640,yy),f"{l2}:",font=fonts["body_b"],fill=gray); d.text((800,yy),str(v2),font=fonts["body"],fill=dark); yy+=46
-        d.line((62,1680,1178,1680),fill=line,width=2); d.text((62,1695),"Evidencia capturada do preview composto - imagem e esqueleto preservam a mesma orientacao.",font=fonts["small"],fill=gray)
+            d.text((110, img_top + 70), "Imagem da evidencia nao encontrada.", font=fonts["body"], fill=gray)
+
+        y = 1405
+        d.text((82, y), "INDICADORES DA CAPTURA", font=fonts["section"], fill=navy)
+        y += 66
+        card_gap = 20
+        card_w = int((W - 164 - card_gap * 3) / 4)
+        cards = [
+            ("IRE", f"{record.get('ire', 0)}/100", cyan),
+            ("RULA", f"{record.get('rula', 0)}/7", (87, 111, 169)),
+            ("REBA", f"{record.get('reba', 0)}/15", (117, 88, 165)),
+            ("QUALIDADE", f"{float(record.get('quality', 0) or 0):.0f}%", navy),
+        ]
+        for i, item in enumerate(cards):
+            x = 82 + i * (card_w + card_gap)
+            self._pdf_metric_card(d, (x, y, x + card_w, y + 175), *item, fonts)
+
+        y += 215
+        d.text((82, y), "ANGULOS E QUALIDADE", font=fonts["section"], fill=navy)
+        y += 66
+        d.rounded_rectangle((82, y, 1572, y + 355), radius=24, fill=white, outline=line, width=3)
+        d.line((827, y + 20, 827, y + 335), fill=line, width=3)
+        d.line((104, y + 178, 1550, y + 178), fill=line, width=3)
+        items = [
+            ("TRONCO", fmt_angle(record.get("trunk")), "PESCOCO", fmt_angle(record.get("neck"))),
+            ("BRACO D / E", f"{fmt_angle(record.get('shoulder_r'))} / {fmt_angle(record.get('shoulder_l'))}", "JOELHO D / E", f"{fmt_angle(record.get('knee_r'))} / {fmt_angle(record.get('knee_l'))}"),
+        ]
+        for row, (l1, v1, l2, v2) in enumerate(items):
+            yy = y + 34 + row * 176
+            d.text((116, yy), l1, font=fonts["label"], fill=gray)
+            d.text((116, yy + 46), v1, font=fonts["angle"], fill=dark)
+            d.text((862, yy), l2, font=fonts["label"], fill=gray)
+            d.text((862, yy + 46), v2, font=fonts["angle"], fill=dark)
+
+        bottom_y = y + 385
+        coverage = float(record.get("coverage", 0) or 0)
+        quality = float(record.get("quality", 0) or 0)
+        d.rounded_rectangle((82, bottom_y, 1572, bottom_y + 118), radius=20, fill=(235, 243, 247))
+        d.text((110, bottom_y + 24), f"Qualidade: {quality:.0f}%", font=fonts["body_b"], fill=navy2)
+        d.text((520, bottom_y + 24), f"Cobertura: {coverage:.0f}%", font=fonts["body_b"], fill=navy2)
+        d.text(
+            (905, bottom_y + 24),
+            f"Cam {record.get('camera_preview_rotation', '-')} | Pose {record.get('pose_rotation', '-')}",
+            font=fonts["body_b"],
+            fill=navy2,
+        )
+        d.text(
+            (110, bottom_y + 72),
+            f"Espelho X {'SIM' if record.get('mirror_x') else 'NAO'} | Y {'SIM' if record.get('mirror_y') else 'NAO'}",
+            font=fonts["small"],
+            fill=gray,
+        )
+
+        d.line((82, 2260, 1572, 2260), fill=line, width=2)
+        d.text((82, 2280), "Imagem capturada do preview composto: camera e esqueleto preservam a mesma orientacao.", font=fonts["tiny"], fill=gray)
         return page
 
     def _export_report_android(self, pdf_path):
@@ -1644,20 +2017,20 @@ class NR17Screen(BoxLayout):
 
     def generate_report(self, *_):
         try:
-            if not self.evidence_records and self.camera and self.camera.texture is not None:
-                try:
-                    self._capture_evidence_file()
-                except Exception:
-                    pass
+            evidencias = self._ordered_evidence_records()
             snapshot = self._assessment_snapshot()
+            snapshot["evidencias"] = list(evidencias)
             self._save_assessment_json()
-            pages = [self._pdf_summary_page(snapshot)]
-            total_pages = 1 + len(self.evidence_records)
-            for idx, record in enumerate(self.evidence_records, start=1):
-                pages.append(self._pdf_evidence_page(record, idx, total_pages))
+            total_pages = 2 + len(evidencias)
+            pages = [
+                self._pdf_summary_page(snapshot),
+                self._pdf_posture_page(snapshot, total_pages),
+            ]
+            for idx, record in enumerate(evidencias, start=1):
+                pages.append(self._pdf_evidence_page(record, idx, idx + 2, total_pages))
             pdf_name = f"relatorio_NR17_{self.assessment_id}.pdf"
             pdf_path = self._assessment_dir() / pdf_name
-            pages[0].save(str(pdf_path), "PDF", resolution=150.0, save_all=True, append_images=pages[1:])
+            pages[0].save(str(pdf_path), "PDF", resolution=200.0, save_all=True, append_images=pages[1:])
             exported = self._export_report_android(pdf_path)
             self.last_exported_report = exported or str(pdf_path)
             if exported and exported.startswith("content://"):
@@ -1680,6 +2053,10 @@ class NR17Screen(BoxLayout):
         self.assessment_started_at = datetime.now()
         self.assessment_id = self.assessment_started_at.strftime("%Y%m%d_%H%M%S")
         self.assessment_dir = None; self.evidence_records = []; self.last_exported_report = None
+        self._factor_high_since = {name: None for name in FACTOR_ORDER}
+        self._factor_best_severity = {}
+        self._auto_evidence_busy = False
+        self._auto_evidence_last_capture = 0.0
         self._landmark_state = {}; self._landmark_streak = {}
         self._refresh_evidence_count()
         self.status_text = "Nova avaliação iniciada."
