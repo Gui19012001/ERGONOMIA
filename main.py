@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.7
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.8
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -32,7 +32,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -769,26 +769,80 @@ class NR17Screen(BoxLayout):
         Clock.schedule_once(lambda dt: self._request_camera_permission(), 0.2)
 
     # --------------------------- Configuração persistente ---------------------------
+    # A calibração é salva automaticamente em DOIS locais:
+    # 1) camera_calibration.json no user_data_dir do Kivy;
+    # 2) SharedPreferences nativas do Android.
+    # Isso evita perder a configuração ao fechar/reabrir ou atualizar o APK.
     def _calibration_path(self):
         app = App.get_running_app()
-        base = Path(getattr(app, "user_data_dir", str(BASE_DIR)))
+        base = Path(getattr(app, "user_data_dir", str(BASE_DIR)) if app else str(BASE_DIR))
         base.mkdir(parents=True, exist_ok=True)
         return base / "camera_calibration.json"
 
+    def _load_calibration_android(self):
+        if platform != "android":
+            return False
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            prefs = activity.getSharedPreferences("nr17_camera_calibration", 0)
+            if not bool(prefs.getBoolean("configured", False)):
+                return False
+            self.camera_preview_rotation = int(
+                prefs.getInt("camera_preview_rotation", int(self.camera_preview_rotation))
+            ) % 360
+            self.pose_rotation = int(
+                prefs.getInt("pose_rotation", int(self.pose_rotation))
+            ) % 360
+            self.mirror_x = bool(prefs.getBoolean("mirror_x", bool(self.mirror_x)))
+            self.mirror_y = bool(prefs.getBoolean("mirror_y", bool(self.mirror_y)))
+            return True
+        except Exception:
+            return False
+
+    def _save_calibration_android(self):
+        if platform != "android":
+            return False
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            prefs = activity.getSharedPreferences("nr17_camera_calibration", 0)
+            editor = prefs.edit()
+            editor.putBoolean("configured", True)
+            editor.putInt("camera_preview_rotation", int(self.camera_preview_rotation) % 360)
+            editor.putInt("pose_rotation", int(self.pose_rotation) % 360)
+            editor.putBoolean("mirror_x", bool(self.mirror_x))
+            editor.putBoolean("mirror_y", bool(self.mirror_y))
+            editor.putString("saved_at", datetime.now().isoformat(timespec="seconds"))
+            editor.apply()
+            return True
+        except Exception:
+            return False
+
     def _load_calibration(self):
+        loaded = self._load_calibration_android()
+        if loaded:
+            return True
         try:
             path = self._calibration_path()
             if not path.exists():
-                return
+                return False
             cfg = json.loads(path.read_text(encoding="utf-8"))
-            self.camera_preview_rotation = int(cfg.get("camera_preview_rotation", self.camera_preview_rotation)) % 360
+            self.camera_preview_rotation = int(
+                cfg.get("camera_preview_rotation", self.camera_preview_rotation)
+            ) % 360
             self.pose_rotation = int(cfg.get("pose_rotation", self.pose_rotation)) % 360
             self.mirror_x = bool(cfg.get("mirror_x", self.mirror_x))
             self.mirror_y = bool(cfg.get("mirror_y", self.mirror_y))
+            # Migra automaticamente um JSON antigo para SharedPreferences.
+            self._save_calibration_android()
+            return True
         except Exception:
-            pass
+            return False
 
-    def _save_calibration(self):
+    def _save_calibration(self, show_status=False):
         cfg = {
             "camera_preview_rotation": int(self.camera_preview_rotation) % 360,
             "pose_rotation": int(self.pose_rotation) % 360,
@@ -796,13 +850,25 @@ class NR17Screen(BoxLayout):
             "mirror_y": bool(self.mirror_y),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
-        path = self._calibration_path()
-        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.status_text = "Calibração da câmera salva neste tablet."
-        self._refresh_calibration_status()
-        return path
+        json_saved = False
+        path = None
+        try:
+            path = self._calibration_path()
+            path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            json_saved = True
+        except Exception:
+            pass
 
-    def _apply_calibration(self):
+        android_saved = self._save_calibration_android()
+        if show_status:
+            if json_saved or android_saved:
+                self.status_text = "Calibração salva automaticamente neste tablet."
+            else:
+                self.status_text = "Não foi possível salvar a calibração."
+        self._refresh_calibration_status()
+        return path if json_saved else None
+
+    def _apply_calibration(self, autosave=True):
         self.camera_preview_rotation %= 360
         self.pose_rotation %= 360
         if self.scatter:
@@ -814,6 +880,8 @@ class NR17Screen(BoxLayout):
         self.last_pose_seq = -1
         self._fit_preview()
         self._refresh_calibration_status()
+        if autosave:
+            self._save_calibration(show_status=False)
 
     def _refresh_calibration_status(self):
         if self._calibration_status:
@@ -845,14 +913,14 @@ class NR17Screen(BoxLayout):
         self.pose_rotation = DEFAULT_POSE_ROTATION
         self.mirror_x = DEFAULT_MIRROR_X
         self.mirror_y = DEFAULT_MIRROR_Y
-        self._apply_calibration()
-        self.status_text = "Padrão restaurado. Use SALVAR para manter após fechar o aplicativo."
+        self._apply_calibration(autosave=True)
+        self.status_text = "Padrão restaurado e salvo automaticamente."
 
     def open_calibration(self, *_):
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
         title = self._label("CALIBRAÇÃO AO VIVO", CYAN, "20sp", True)
         instruction = self._label(
-            "Fique em frente à câmera e levante o braço DIREITO. Ajuste até o esqueleto ficar exatamente sobre a pessoa. As mudanças são aplicadas na hora.",
+            "Fique em frente à câmera e levante o braço DIREITO. Ajuste até o esqueleto ficar exatamente sobre a pessoa. Cada alteração é aplicada e SALVA automaticamente neste tablet.",
             TEXT, "13sp"
         )
         instruction.size_hint_y = None
@@ -871,10 +939,15 @@ class NR17Screen(BoxLayout):
         grid.add_widget(self._button("ESPELHAR VERTICAL", self._calib_mirror_y))
         content.add_widget(grid)
 
-        footer = GridLayout(cols=3, spacing=dp(8), size_hint_y=None, height=dp(52))
+        footer = GridLayout(cols=2, spacing=dp(8), size_hint_y=None, height=dp(52))
         footer.add_widget(self._button("RESTAURAR PADRÃO", self._calib_defaults))
-        footer.add_widget(self._button("SALVAR", lambda *_: self._save_calibration(), primary=True))
-        close_btn = self._button("FECHAR", lambda *_: self._calibration_popup.dismiss())
+
+        def close_calibration(*_):
+            self._save_calibration(show_status=True)
+            if self._calibration_popup:
+                self._calibration_popup.dismiss()
+
+        close_btn = self._button("FECHAR · SALVO AUTOMATICAMENTE", close_calibration, primary=True)
         footer.add_widget(close_btn)
         content.add_widget(footer)
 
@@ -2084,6 +2157,10 @@ class NR17App(App):
 
     def on_pause(self):
         try:
+            self.screen._save_calibration(show_status=False)
+        except Exception:
+            pass
+        try:
             self.screen.stop_camera()
         except Exception:
             pass
@@ -2091,11 +2168,20 @@ class NR17App(App):
 
     def on_resume(self):
         try:
+            self.screen._load_calibration()
+            self.screen._apply_calibration(autosave=False)
+        except Exception:
+            pass
+        try:
             Clock.schedule_once(lambda dt: self.screen.start_camera(), 0.5)
         except Exception:
             pass
 
     def on_stop(self):
+        try:
+            self.screen._save_calibration(show_status=False)
+        except Exception:
+            pass
         try:
             self.screen.shutdown()
         except Exception:
