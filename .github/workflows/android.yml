@@ -8,20 +8,32 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # ==========================================================
+      # REPOSITÓRIO
+      # ==========================================================
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ==========================================================
+      # PYTHON DO HOST
+      # ==========================================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ==========================================================
+      # JAVA
+      # ==========================================================
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
+      # ==========================================================
+      # DEPENDÊNCIAS LINUX
+      # ==========================================================
       - name: Install Linux dependencies
         run: |
           sudo apt update
@@ -55,6 +67,9 @@ jobs:
             zip \
             zlib1g-dev
 
+      # ==========================================================
+      # BUILDOZER
+      # ==========================================================
       - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip wheel
@@ -63,23 +78,51 @@ jobs:
             cython==0.29.34 \
             buildozer
 
+      # ==========================================================
+      # CONFIGURAÇÃO DO TABLET
+      #
+      # IMPORTANTE:
+      # CAMERA_PREVIEW_ROTATION = 0
+      # POSE_ROTATION           = 0
+      #
+      # O tablet já está trabalhando em landscape.
+      # Não vamos girar novamente a câmera nem os landmarks.
+      # ==========================================================
       - name: Criar configuracao tablet
         run: |
           cat > teste.env <<'EOF'
           CAMERA_TRASEIRA_INDEX=0
-          CAMERA_PREVIEW_ROTATION=270
-          POSE_ROTATION=270
+
+          CAMERA_PREVIEW_ROTATION=0
+          POSE_ROTATION=0
+
           CAMERA_WIDTH=1280
           CAMERA_HEIGHT=720
+
           POSE_INPUT_LONG_SIDE=640
           POSE_INTERVAL=0.12
           POSE_MIN_CONFIDENCE=0.45
+
           IRE_TRONCO=25
           IRE_PESCOCO=25
           IRE_BRACO=60
           IRE_JOELHO=130
           EOF
 
+      # ==========================================================
+      # MOSTRAR CONFIGURAÇÃO
+      # ==========================================================
+      - name: Conferir configuracao tablet
+        run: |
+          echo "========================================"
+          echo "CONFIGURACAO DO TABLET"
+          echo "========================================"
+          cat teste.env
+          echo "========================================"
+
+      # ==========================================================
+      # LIMPEZA TOTAL
+      # ==========================================================
       - name: Limpar completamente build anterior
         run: |
           rm -rf .buildozer
@@ -87,28 +130,58 @@ jobs:
           rm -rf ~/.buildozer
           rm -rf ~/.cache/pip
 
+      # ==========================================================
+      # CONFERÊNCIA DO BUILDOZER
+      # ==========================================================
       - name: Conferir buildozer
         run: |
-          echo "=============================="
+          echo "========================================"
           echo "HOST PYTHON"
           python --version
 
-          echo "=============================="
+          echo "========================================"
+          echo "JAVA"
+          java -version
+
+          echo "========================================"
           echo "P4A CONFIGURADO"
           grep "^p4a.branch" buildozer.spec
 
-          echo "=============================="
+          echo "========================================"
           echo "REQUIREMENTS"
           grep "^requirements" buildozer.spec
 
-          echo "=============================="
+          echo "========================================"
+          echo "ANDROID API / MIN API / NDK"
+          grep "^android.api" buildozer.spec || true
+          grep "^android.minapi" buildozer.spec || true
+          grep "^android.ndk" buildozer.spec || true
 
+          echo "========================================"
+
+      # ==========================================================
+      # BUILD APK
+      # ==========================================================
       - name: Build APK
         env:
           PYTHONFORANDROID_PREREQUISITES_INSTALL_INTERACTIVE: "0"
         run: |
           buildozer -v android debug
 
+      # ==========================================================
+      # LOCALIZAR APK
+      # ==========================================================
+      - name: Conferir APK gerado
+        run: |
+          echo "========================================"
+          echo "APK GERADO"
+          echo "========================================"
+          find bin -maxdepth 1 -type f -name "*.apk" -print
+          echo "========================================"
+
+      # ==========================================================
+      # ARTIFACT
+      # ==========================================================
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
