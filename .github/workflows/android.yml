@@ -85,7 +85,7 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.4 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.5 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
