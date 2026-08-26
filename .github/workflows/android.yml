@@ -81,12 +81,12 @@ jobs:
       # ==========================================================
       # CONFIGURAÇÃO DO TABLET
       #
-      # IMPORTANTE:
-      # CAMERA_PREVIEW_ROTATION = 0
-      # POSE_ROTATION           = 0
+      # CAMERA:
+      # O preview já está correto em landscape.
       #
-      # O tablet já está trabalhando em landscape.
-      # Não vamos girar novamente a câmera nem os landmarks.
+      # POSE:
+      # O frame bruto precisa ser compensado em 270 graus
+      # antes da interpretação do ML Kit.
       # ==========================================================
       - name: Criar configuracao tablet
         run: |
@@ -94,7 +94,7 @@ jobs:
           CAMERA_TRASEIRA_INDEX=0
 
           CAMERA_PREVIEW_ROTATION=0
-          POSE_ROTATION=0
+          POSE_ROTATION=270
 
           CAMERA_WIDTH=1280
           CAMERA_HEIGHT=720
@@ -120,8 +120,19 @@ jobs:
           cat teste.env
           echo "========================================"
 
+          echo ""
+          echo "ROTACAO ESPERADA"
+          echo "Preview da camera: 0 graus"
+          echo "Pose ML Kit:       270 graus"
+          echo ""
+
       # ==========================================================
       # LIMPEZA TOTAL
+      #
+      # Evita reutilizar builds antigos com:
+      # - Python Android antigo
+      # - configuracao antiga de rotacao
+      # - caches anteriores
       # ==========================================================
       - name: Limpar completamente build anterior
         run: |
@@ -158,6 +169,10 @@ jobs:
           grep "^android.ndk" buildozer.spec || true
 
           echo "========================================"
+          echo "ML KIT"
+          grep "^android.gradle_dependencies" buildozer.spec || true
+
+          echo "========================================"
 
       # ==========================================================
       # BUILD APK
@@ -176,8 +191,19 @@ jobs:
           echo "========================================"
           echo "APK GERADO"
           echo "========================================"
+
           find bin -maxdepth 1 -type f -name "*.apk" -print
+
           echo "========================================"
+
+          APK_COUNT=$(find bin -maxdepth 1 -type f -name "*.apk" | wc -l)
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "ERRO: Nenhum APK encontrado."
+            exit 1
+          fi
+
+          echo "Total de APKs encontrados: $APK_COUNT"
 
       # ==========================================================
       # ARTIFACT
