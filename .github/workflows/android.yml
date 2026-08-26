@@ -5,7 +5,7 @@ on:
 
 jobs:
   build-android:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       # ==========================================================
@@ -81,21 +81,23 @@ jobs:
             buildozer
 
       # ==========================================================
-      # CONFIGURAÇÃO DO TABLET
+      # CONFIGURAÇÃO PADRÃO DO TABLET
       #
-      # CAMERA_PREVIEW_ROTATION=0
-      #   Camera já está correta em LANDSCAPE.
-      #
-      # POSE_ROTATION=270
-      #   Corrige a orientação do frame enviado ao ML Kit.
+      # IMPORTANTE:
+      # Estes valores são apenas o padrão do primeiro uso.
+      # No APK 0.1.4 o usuário pode alterar rotação e espelhamento
+      # em ⚙ CÂMERA e salvar localmente no tablet.
+      # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
       - name: Criar configuracao tablet
         run: |
-          cat > teste.env <<'EOF'
+          cat > teste.env <<'ENVEOF'
           CAMERA_TRASEIRA_INDEX=0
 
           CAMERA_PREVIEW_ROTATION=0
           POSE_ROTATION=270
+          CAMERA_PREVIEW_MIRROR_X=1
+          CAMERA_PREVIEW_MIRROR_Y=0
 
           CAMERA_WIDTH=1280
           CAMERA_HEIGHT=720
@@ -103,12 +105,16 @@ jobs:
           POSE_INPUT_LONG_SIDE=640
           POSE_INTERVAL=0.12
           POSE_MIN_CONFIDENCE=0.45
+          ANGLE_MIN_CONFIDENCE=0.60
+          LANDMARK_CONFIRM_FRAMES=2
+          LANDMARK_JUMP_LIMIT=0.18
+          LANDMARK_SMOOTH_ALPHA=0.65
 
           IRE_TRONCO=25
           IRE_PESCOCO=25
           IRE_BRACO=60
           IRE_JOELHO=130
-          EOF
+          ENVEOF
 
       # ==========================================================
       # CONFERIR CONFIGURAÇÃO
@@ -116,24 +122,15 @@ jobs:
       - name: Conferir configuracao tablet
         run: |
           echo "========================================"
-          echo "CONFIGURACAO DO TABLET"
+          echo "CONFIGURACAO PADRAO DO TABLET"
           echo "========================================"
-
           cat teste.env
-
           echo "========================================"
-          echo "ROTACAO"
-          echo "========================================"
-          echo "Preview da camera : 0 graus"
-          echo "Pose ML Kit       : 270 graus"
+          echo "No APK: usar ⚙ CAMERA para calibracao ao vivo"
           echo "========================================"
 
       # ==========================================================
       # LIMPEZA DO BUILD DO PROJETO
-      #
-      # Não apagamos ~/.buildozer aqui.
-      # O próprio runner é descartável e isso evita eliminar
-      # downloads válidos feitos durante a preparação.
       # ==========================================================
       - name: Limpar build anterior
         run: |
@@ -192,38 +189,20 @@ jobs:
           echo "========================================"
           grep "^android.gradle_dependencies" buildozer.spec || true
 
-          echo ""
-          echo "========================================"
-
       # ==========================================================
       # BUILD APK
-      #
-      # IMPORTANTE:
-      # O servidor principal do FreeType retornou HTTP 502.
-      #
-      # O p4a v2024.01.21 usa FreeType 2.10.1 e permite
-      # sobrescrever a URL através de URL_freetype.
       # ==========================================================
       - name: Build APK
         env:
           PYTHONFORANDROID_PREREQUISITES_INSTALL_INTERACTIVE: "0"
-
-          # Mirror Savannah para evitar:
-          # download.savannah.gnu.org -> HTTP 502
           URL_freetype: "https://download-mirror.savannah.gnu.org/releases/freetype/freetype-{version}.tar.gz"
-
         run: |
           echo "========================================"
           echo "INICIANDO BUILD ANDROID"
           echo "========================================"
-
-          echo ""
           echo "FREETYPE MIRROR:"
           echo "$URL_freetype"
-
-          echo ""
           echo "========================================"
-
           buildozer -v android debug
 
       # ==========================================================
@@ -236,19 +215,16 @@ jobs:
           echo "========================================"
 
           find bin -maxdepth 1 -type f -name "*.apk" -print
-
           APK_COUNT=$(find bin -maxdepth 1 -type f -name "*.apk" | wc -l)
 
           echo ""
           echo "Total de APKs encontrados: $APK_COUNT"
 
           if [ "$APK_COUNT" -eq 0 ]; then
-            echo ""
             echo "ERRO: Nenhum APK foi encontrado."
             exit 1
           fi
 
-          echo ""
           echo "========================================"
           echo "BUILD FINALIZADO COM SUCESSO"
           echo "========================================"
