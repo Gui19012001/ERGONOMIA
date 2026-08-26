@@ -1,37 +1,382 @@
-[app]
+package br.com.ibero.nr17;
 
-title = NR17 Visao
-package.name = nr17visao
-package.domain = br.com.ibero
+import android.graphics.Bitmap;
+import android.graphics.PointF;
+import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
 
-source.dir = .
-source.include_exts = py,java,txt,json,env,png,jpg,jpeg
-source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv,.venv
+import com.google.android.gms.tasks.OnCompleteListener;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.android.gms.tasks.Task;
 
-version = 0.1.3
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.pose.Pose;
+import com.google.mlkit.vision.pose.PoseDetection;
+import com.google.mlkit.vision.pose.PoseDetector;
+import com.google.mlkit.vision.pose.PoseLandmark;
+import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions;
 
-# PDF é gerado pelo Pillow. Não adicionamos ReportLab.
-requirements = python3,kivy,pillow
+import org.json.JSONObject;
 
-orientation = landscape
-fullscreen = 0
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 
-android.permissions = CAMERA,INTERNET,WAKE_LOCK
+/**
+ * Ponte Android nativa para o Python/Kivy.
+ *
+ * Recebe um frame RGBA reduzido, executa ML Kit Pose em STREAM_MODE
+ * e expõe o resultado mais recente como JSON. Somente um frame é
+ * processado por vez, evitando backlog e travamento.
+ */
+public class PoseAnalyzer {
+    private final PoseDetector detector;
+    private final AtomicBoolean busy = new AtomicBoolean(false);
+    private final AtomicLong sequence = new AtomicLong(0);
+    private volatile String latestJson = "";
 
-android.api = 34
-android.minapi = 24
-android.ndk = 25b
-android.archs = arm64-v8a
-android.accept_sdk_license = True
+    public PoseAnalyzer() {
+        PoseDetectorOptions options =
+            new PoseDetectorOptions.Builder()
+                .setDetectorMode(PoseDetectorOptions.STREAM_MODE)
+                .build();
 
-android.add_src = android_src
-android.gradle_dependencies = com.google.mlkit:pose-detection:18.0.0-beta5
-android.enable_androidx = True
-android.add_compile_options = "sourceCompatibility = 1.8", "targetCompatibility = 1.8"
+        detector = PoseDetection.getClient(options);
+    }
 
-p4a.branch = v2024.01.21
+    public boolean isBusy() {
+        return busy.get();
+    }
 
-[buildozer]
+    public String getLatestJson() {
+        return latestJson == null ? "" : latestJson;
+    }
 
-log_level = 2
-warn_on_root = 0
+    public boolean analyze(byte[] rgba, int width, int height, int rotationDegrees) {
+        if (rgba == null || width <= 1 || height <= 1) {
+            return false;
+        }
+        if (rgba.length < width * height * 4) {
+            return false;
+        }
+        if (!busy.compareAndSet(false, true)) {
+            return false;
+        }
+
+        final long started = System.currentTimeMillis();
+        final Bitmap bitmap;
+
+        try {
+            int pixelCount = width * height;
+            int[] colors = new int[pixelCount];
+
+            int src = 0;
+            for (int i = 0; i < pixelCount; i++) {
+                int r = rgba[src] & 0xFF;
+                int g = rgba[src + 1] & 0xFF;
+                int b = rgba[src + 2] & 0xFF;
+                int a = rgba[src + 3] & 0xFF;
+                if (a == 0) a = 255;
+                colors[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                src += 4;
+            }
+
+            bitmap = Bitmap.createBitmap(colors, width, height, Bitmap.Config.ARGB_8888);
+        } catch (Exception exc) {
+            busy.set(false);
+            latestJson = errorJson(exc, started);
+            return false;
+        }
+
+        final int rotation = normalizeRotation(rotationDegrees);
+        final int outputWidth = (rotation == 90 || rotation == 270) ? height : width;
+        final int outputHeight = (rotation == 90 || rotation == 270) ? width : height;
+
+        InputImage image = InputImage.fromBitmap(bitmap, rotation);
+
+        detector.process(image)
+            .addOnSuccessListener(new OnSuccessListener<Pose>() {
+                @Override
+                public void onSuccess(Pose pose) {
+                    latestJson = buildPoseJson(
+                        pose,
+                        width,
+                        height,
+                        outputWidth,
+                        outputHeight,
+                        rotation,
+                        started
+                    );
+                }
+            })
+            .addOnFailureListener(new OnFailureListener() {
+                @Override
+                public void onFailure(Exception e) {
+                    latestJson = errorJson(e, started);
+                }
+            })
+            .addOnCompleteListener(new OnCompleteListener<Pose>() {
+                @Override
+                public void onComplete(Task<Pose> task) {
+                    try {
+                        bitmap.recycle();
+                    } catch (Exception ignored) {}
+                    busy.set(false);
+                }
+            });
+
+        return true;
+    }
+
+    private static int normalizeRotation(int degrees) {
+        int d = ((degrees % 360) + 360) % 360;
+        if (d < 45) return 0;
+        if (d < 135) return 90;
+        if (d < 225) return 180;
+        if (d < 315) return 270;
+        return 0;
+    }
+
+    private String errorJson(Exception exc, long started) {
+        try {
+            JSONObject root = new JSONObject();
+            root.put("seq", sequence.incrementAndGet());
+            root.put("detected", false);
+            root.put("inferenceMs", Math.max(0, System.currentTimeMillis() - started));
+            root.put("error", exc == null ? "erro desconhecido" : String.valueOf(exc.getMessage()));
+            return root.toString();
+        } catch (Exception ignored) {
+            return "{\"detected\":false}";
+        }
+    }
+
+    private String buildPoseJson(
+        Pose pose,
+        int sourceWidth,
+        int sourceHeight,
+        int outputWidth,
+        int outputHeight,
+        int rotation,
+        long started
+    ) {
+        try {
+            JSONObject root = new JSONObject();
+            root.put("seq", sequence.incrementAndGet());
+            root.put("sourceWidth", sourceWidth);
+            root.put("sourceHeight", sourceHeight);
+            root.put("outputWidth", outputWidth);
+            root.put("outputHeight", outputHeight);
+            root.put("rotation", rotation);
+            root.put("inferenceMs", Math.max(0, System.currentTimeMillis() - started));
+
+            boolean detected = pose != null && !pose.getAllPoseLandmarks().isEmpty();
+            root.put("detected", detected);
+
+            JSONObject points = new JSONObject();
+
+            if (detected) {
+                add(points, "nose", pose, PoseLandmark.NOSE, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+
+                add(points, "left_ear", pose, PoseLandmark.LEFT_EAR, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_ear", pose, PoseLandmark.RIGHT_EAR, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+
+                add(points, "left_shoulder", pose, PoseLandmark.LEFT_SHOULDER, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_shoulder", pose, PoseLandmark.RIGHT_SHOULDER, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "left_elbow", pose, PoseLandmark.LEFT_ELBOW, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_elbow", pose, PoseLandmark.RIGHT_ELBOW, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "left_wrist", pose, PoseLandmark.LEFT_WRIST, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_wrist", pose, PoseLandmark.RIGHT_WRIST, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+
+                add(points, "left_pinky", pose, PoseLandmark.LEFT_PINKY, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_pinky", pose, PoseLandmark.RIGHT_PINKY, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "left_index", pose, PoseLandmark.LEFT_INDEX, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_index", pose, PoseLandmark.RIGHT_INDEX, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "left_thumb", pose, PoseLandmark.LEFT_THUMB, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_thumb", pose, PoseLandmark.RIGHT_THUMB, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+
+                add(points, "left_hip", pose, PoseLandmark.LEFT_HIP, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_hip", pose, PoseLandmark.RIGHT_HIP, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "left_knee", pose, PoseLandmark.LEFT_KNEE, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_knee", pose, PoseLandmark.RIGHT_KNEE, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "left_ankle", pose, PoseLandmark.LEFT_ANKLE, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+                add(points, "right_ankle", pose, PoseLandmark.RIGHT_ANKLE, sourceWidth, sourceHeight, outputWidth, outputHeight, rotation);
+            }
+
+            root.put("landmarks", points);
+            return root.toString();
+        } catch (Exception exc) {
+            return errorJson(exc, started);
+        }
+    }
+
+    private void add(
+        JSONObject points,
+        String name,
+        Pose pose,
+        int landmarkType,
+        int sourceWidth,
+        int sourceHeight,
+        int outputWidth,
+        int outputHeight,
+        int rotation
+    ) {
+        try {
+            PoseLandmark lm = pose.getPoseLandmark(landmarkType);
+            if (lm == null) return;
+
+            PointF p = lm.getPosition();
+
+            // Coordenada fornecida pelo ML Kit no espaço da imagem orientada.
+            float xn = outputWidth > 0 ? p.x / (float) outputWidth : 0f;
+            float yn = outputHeight > 0 ? p.y / (float) outputHeight : 0f;
+            xn = clamp01(xn);
+            yn = clamp01(yn);
+
+            // Transformação INVERSA: volta da imagem orientada pelo ML Kit
+            // para o frame original da textura Kivy.
+            float sx;
+            float sy;
+            if (rotation == 90) {
+                // CW 90: oriented=(1-sourceY, sourceX)
+                sx = yn;
+                sy = 1f - xn;
+            } else if (rotation == 180) {
+                sx = 1f - xn;
+                sy = 1f - yn;
+            } else if (rotation == 270) {
+                // CW 270: oriented=(sourceY, 1-sourceX)
+                sx = 1f - yn;
+                sy = xn;
+            } else {
+                sx = xn;
+                sy = yn;
+            }
+
+            JSONObject obj = new JSONObject();
+
+            // x/y são mantidos para diagnóstico da imagem orientada.
+            obj.put("x", xn);
+            obj.put("y", yn);
+
+            // sx/sy são usados pelo APK para overlay e ângulos.
+            obj.put("sx", clamp01(sx));
+            obj.put("sy", clamp01(sy));
+
+            obj.put("rawX", p.x);
+            obj.put("rawY", p.y);
+            obj.put("z", lm.getPosition3D().getZ());
+            obj.put("c", lm.getInFrameLikelihood());
+            points.put(name, obj);
+        } catch (Exception ignored) {}
+    }
+
+    private static float clamp01(float v) {
+        return Math.max(0f, Math.min(1f, v));
+    }
+
+    /**
+     * Copia um arquivo interno do APK para Downloads/NR17.
+     * Em Android 10+ usa MediaStore, sem pedir permissão de armazenamento.
+     * Em versões anteriores usa a pasta externa privada do aplicativo.
+     */
+    public String exportFileToDownloads(Activity activity, String sourcePath, String displayName) {
+        if (activity == null || sourcePath == null || displayName == null) {
+            return "ERROR:parametros invalidos";
+        }
+
+        File source = new File(sourcePath);
+        if (!source.exists()) {
+            return "ERROR:arquivo fonte nao encontrado";
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentResolver resolver = activity.getContentResolver();
+
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
+                values.put(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    Environment.DIRECTORY_DOWNLOADS + "/NR17"
+                );
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                Uri uri = resolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    values
+                );
+
+                if (uri == null) {
+                    return "ERROR:falha ao criar arquivo em Downloads";
+                }
+
+                try (
+                    InputStream in = new FileInputStream(source);
+                    OutputStream out = resolver.openOutputStream(uri)
+                ) {
+                    if (out == null) {
+                        return "ERROR:falha ao abrir destino";
+                    }
+                    byte[] buffer = new byte[64 * 1024];
+                    int len;
+                    while ((len = in.read(buffer)) > 0) {
+                        out.write(buffer, 0, len);
+                    }
+                    out.flush();
+                }
+
+                ContentValues done = new ContentValues();
+                done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                resolver.update(uri, done, null, null);
+
+                return uri.toString();
+            }
+
+            // Fallback sem permissão especial: Documents privado do app.
+            File docs = activity.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
+            if (docs == null) {
+                return "ERROR:armazenamento externo indisponivel";
+            }
+
+            File dir = new File(docs, "NR17");
+            if (!dir.exists() && !dir.mkdirs()) {
+                return "ERROR:nao foi possivel criar pasta NR17";
+            }
+
+            File dest = new File(dir, displayName);
+            try (
+                InputStream in = new FileInputStream(source);
+                OutputStream out = new FileOutputStream(dest)
+            ) {
+                byte[] buffer = new byte[64 * 1024];
+                int len;
+                while ((len = in.read(buffer)) > 0) {
+                    out.write(buffer, 0, len);
+                }
+                out.flush();
+            }
+
+            return dest.getAbsolutePath();
+        } catch (Exception exc) {
+            return "ERROR:" + String.valueOf(exc.getMessage());
+        }
+    }
+
+    public void close() {
+        try {
+            detector.close();
+        } catch (Exception ignored) {}
+        busy.set(false);
+    }
+}
