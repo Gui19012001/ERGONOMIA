@@ -85,7 +85,7 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.5 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.7 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
@@ -109,6 +109,16 @@ jobs:
           LANDMARK_CONFIRM_FRAMES=2
           LANDMARK_JUMP_LIMIT=0.18
           LANDMARK_SMOOTH_ALPHA=0.65
+
+          # Evidencia automatica: guarda somente a mais critica por fator
+          AUTO_EVIDENCE_HOLD_S=0.80
+          AUTO_EVIDENCE_COOLDOWN_S=2.00
+          AUTO_EVIDENCE_MIN_QUALITY=60
+          AUTO_EVIDENCE_MIN_COVERAGE=55
+          AUTO_EVIDENCE_DELTA_TRUNK=2.0
+          AUTO_EVIDENCE_DELTA_NECK=2.0
+          AUTO_EVIDENCE_DELTA_ARM=3.0
+          AUTO_EVIDENCE_DELTA_KNEE=3.0
 
           IRE_TRONCO=25
           IRE_PESCOCO=25
