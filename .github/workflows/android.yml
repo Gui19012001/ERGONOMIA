@@ -85,13 +85,20 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.8 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.9 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
       - name: Criar configuracao tablet
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          cat > teste.env <<'ENVEOF'
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "ERRO: crie o Repository Secret GEMINI_API_KEY antes do build."
+            exit 1
+          fi
+
+          cat > teste.env <<ENVEOF
           CAMERA_TRASEIRA_INDEX=0
 
           CAMERA_PREVIEW_ROTATION=0
@@ -120,6 +127,14 @@ jobs:
           AUTO_EVIDENCE_DELTA_ARM=3.0
           AUTO_EVIDENCE_DELTA_KNEE=3.0
 
+          # Gemini multimodal - chave vem do GitHub Secret
+          GEMINI_API_KEY=$GEMINI_API_KEY
+          GEMINI_MODEL=gemini-2.5-flash
+          GEMINI_FALLBACK_MODEL=gemini-2.5-flash-lite
+          GEMINI_TIMEOUT=75
+          GEMINI_IMAGE_LONG_SIDE=1024
+          GEMINI_IMAGE_QUALITY=82
+
           IRE_TRONCO=25
           IRE_PESCOCO=25
           IRE_BRACO=60
@@ -134,9 +149,11 @@ jobs:
           echo "========================================"
           echo "CONFIGURACAO PADRAO DO TABLET"
           echo "========================================"
-          cat teste.env
+          grep -v '^GEMINI_API_KEY=' teste.env
+          echo "GEMINI_API_KEY=***CONFIGURADA VIA SECRET***"
           echo "========================================"
-          echo "No APK: usar ⚙ CAMERA para calibracao ao vivo"
+          echo "No APK: calibracao da camera e salva automaticamente"
+          echo "Relatorio: dados + imagens criticas -> Gemini -> plano de acao"
           echo "========================================"
 
       # ==========================================================
