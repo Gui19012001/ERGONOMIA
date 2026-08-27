@@ -8,7 +8,7 @@ source.dir = .
 source.include_exts = py,java,txt,json,env,png,jpg,jpeg
 source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv,.venv
 
-version = 0.1.12
+version = 0.1.13
 
 # PDF é gerado pelo Pillow. Não adicionamos ReportLab.
 requirements = python3,kivy,pillow
