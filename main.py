@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.12
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.13
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -119,6 +119,13 @@ ANGLE_MIN_CONFIDENCE = max(
 LANDMARK_CONFIRM_FRAMES = max(1, env_int("LANDMARK_CONFIRM_FRAMES", 2))
 LANDMARK_JUMP_LIMIT = max(0.03, min(0.50, env_float("LANDMARK_JUMP_LIMIT", 0.18)))
 LANDMARK_SMOOTH_ALPHA = max(0.10, min(1.0, env_float("LANDMARK_SMOOTH_ALPHA", 0.65)))
+
+# Rastreamento corporal por toque. O toque nao altera a otica da camera:
+# ele fixa a regiao/corpo que deve ser aceito pelo analisador e rejeita
+# leituras parciais (ex.: somente cabeca e ombros).
+BODY_TARGET_MAX_DISTANCE = max(0.12, min(0.60, env_float("BODY_TARGET_MAX_DISTANCE", 0.32)))
+BODY_TARGET_TRACK_ALPHA = max(0.05, min(0.80, env_float("BODY_TARGET_TRACK_ALPHA", 0.22)))
+BODY_TARGET_MIN_BODY_PCT = max(50.0, min(100.0, env_float("BODY_TARGET_MIN_BODY_PCT", 75.0)))
 
 TRUNK_LIMIT = env_float("IRE_TRONCO", 25.0)
 NECK_LIMIT = env_float("IRE_PESCOCO", 25.0)
@@ -748,6 +755,89 @@ class PoseOverlay(Widget):
                     Ellipse(pos=(p[0]-r, p[1]-r), size=(2*r, 2*r))
 
 # ------------------------------------------------------------------
+# PREVIEW COM ALVO CORPORAL POR TOQUE
+# ------------------------------------------------------------------
+class TargetablePreview(FloatLayout):
+    """Area do preview que permite tocar diretamente no trabalhador.
+
+    O ponto tocado vira uma ancora corporal normalizada. O app continua
+    usando o ML Kit normalmente, mas passa a aceitar apenas um corpo
+    completo e coerente com a ancora selecionada.
+    """
+    def __init__(self, target_callback=None, **kwargs):
+        super().__init__(**kwargs)
+        self.target_callback = target_callback
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos):
+            cb = self.target_callback
+            if callable(cb):
+                try:
+                    cb(float(touch.x), float(touch.y))
+                except Exception:
+                    pass
+            return True
+        return super().on_touch_down(touch)
+
+
+class BodyTargetOverlay(Widget):
+    """Desenha o alvo visual sem interferir no esqueleto."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.image_rect = None
+        self.target = None
+        self.state = "idle"  # idle | waiting | locked | lost
+        self.bind(pos=lambda *_: self.redraw(), size=lambda *_: self.redraw())
+
+    def set_image_rect(self, x, y, w, h):
+        self.image_rect = (float(x), float(y), float(w), float(h))
+        self.redraw()
+
+    def set_target(self, target=None, state=None):
+        self.target = tuple(target) if target is not None else None
+        if state is not None:
+            self.state = str(state)
+        self.redraw()
+
+    def clear_target(self):
+        self.target = None
+        self.state = "idle"
+        self.redraw()
+
+    def redraw(self):
+        self.canvas.clear()
+        if self.target is None:
+            return
+        rx, ry, rw, rh = self.image_rect or (self.x, self.y, self.width, self.height)
+        if rw <= 1 or rh <= 1:
+            return
+        try:
+            xn = clamp(float(self.target[0]), 0.0, 1.0)
+            yn = clamp(float(self.target[1]), 0.0, 1.0)
+        except Exception:
+            return
+        px = rx + xn * rw
+        py = ry + (1.0 - yn) * rh
+
+        color = {
+            "locked": GREEN,
+            "lost": RED,
+            "waiting": YELLOW,
+        }.get(self.state, CYAN)
+        r = dp(19)
+        with self.canvas:
+            Color(*color)
+            Line(circle=(px, py, r), width=dp(2.2))
+            Line(points=[px-r-dp(8), py, px-r+dp(2), py], width=dp(2.0))
+            Line(points=[px+r-dp(2), py, px+r+dp(8), py], width=dp(2.0))
+            Line(points=[px, py-r-dp(8), px, py-r+dp(2)], width=dp(2.0))
+            Line(points=[px, py+r-dp(2), px, py+r+dp(8)], width=dp(2.0))
+            Color(1, 1, 1, 0.95)
+            dot = dp(3.5)
+            Ellipse(pos=(px-dot, py-dot), size=(2*dot, 2*dot))
+
+
+# ------------------------------------------------------------------
 # TELA PRINCIPAL
 # ------------------------------------------------------------------
 class NR17Screen(BoxLayout):
@@ -759,6 +849,7 @@ class NR17Screen(BoxLayout):
         self.camera = None
         self.scatter = None
         self.overlay = None
+        self.target_overlay = None
         self.preview_area = None
         self.pose_analyzer = None
         self.pose_supported = False
@@ -826,6 +917,15 @@ class NR17Screen(BoxLayout):
         self._camera_restart_pending = False
         self._camera_stopped_at = 0.0
         self._preview_fit_bound = False
+
+        # Alvo corporal por toque. Nao e autofocus optico: e uma ancora de
+        # rastreamento para manter o corpo correto e rejeitar corpo parcial.
+        self.body_target = None
+        self.body_target_active = False
+        self.body_target_state = "idle"
+        self.body_target_body_pct = 0.0
+        self.body_target_last_distance = None
+        self.target_status_lbl = None
 
         # Modo câmera em tela cheia: reutiliza o MESMO preview/overlay,
         # portanto a análise, as evidências automáticas e a calibração continuam ativas.
@@ -1051,7 +1151,7 @@ class NR17Screen(BoxLayout):
         header = Card(size_hint_y=None, height=dp(62), padding=dp(10), spacing=dp(10))
         title_box = BoxLayout(orientation="vertical")
         title_box.add_widget(self._label("NR-17 | ERGONOMIA POR VISÃO", CYAN, "20sp", True))
-        title_box.add_widget(self._label(f"ML Kit local · evidências críticas · interpretação assistida · PDF · v{APP_VERSION}", MUTED, "11sp"))
+        title_box.add_widget(self._label(f"ML Kit local · alvo corporal por toque · evidências críticas · PDF · v{APP_VERSION}", MUTED, "11sp"))
         self.status_lbl = self._label(self.status_text, YELLOW, "11sp", True)
         self.bind(status_text=lambda *_: setattr(self.status_lbl, "text", self.status_text))
         header.add_widget(title_box)
@@ -1069,14 +1169,14 @@ class NR17Screen(BoxLayout):
 
         main = BoxLayout(orientation="horizontal", spacing=dp(8))
         left = Card(orientation="vertical", padding=dp(6), spacing=dp(6), size_hint_x=0.72)
-        self.preview_area = FloatLayout()
+        self.preview_area = TargetablePreview(target_callback=self._set_body_target_from_touch)
         left.add_widget(self.preview_area)
 
         controls = GridLayout(cols=7, size_hint_y=None, height=dp(52), spacing=dp(5))
         controls.add_widget(self._button("INICIAR", self.start_camera, primary=True))
         controls.add_widget(self._button("PARAR", self.stop_camera))
         controls.add_widget(self._button("CICLO", self.toggle_cycle))
-        self.report_btn = self._button("RELATÓRIO COMPLETO", self.generate_report, primary=True)
+        self.report_btn = self._button("RELATÓRIO", self.generate_report, primary=True)
         controls.add_widget(self.report_btn)
         controls.add_widget(self._button("TELA CHEIA", self.open_fullscreen_camera))
         controls.add_widget(self._button("⚙ CÂMERA", self.open_calibration))
@@ -1084,14 +1184,26 @@ class NR17Screen(BoxLayout):
         left.add_widget(controls)
 
         evidence_bar = Card(
-            orientation="horizontal", size_hint_y=None, height=dp(38),
+            orientation="horizontal", size_hint_y=None, height=dp(54),
             padding=(dp(10), dp(5)), spacing=dp(8)
         )
+        ev_texts = BoxLayout(orientation="vertical", spacing=dp(1))
         self.evidence_count_lbl = self._label(
-            "EVIDÊNCIAS AUTO: 0/4  ·  O app guarda somente a foto mais crítica de cada fator.",
-            MUTED, "10sp", True
+            "EVIDÊNCIAS AUTO: 0/4  ·  somente a foto mais crítica de cada fator.",
+            MUTED, "9sp", True
         )
-        evidence_bar.add_widget(self.evidence_count_lbl)
+        self.target_status_lbl = self._label(
+            "ALVO: AUTOMÁTICO · toque no tronco da pessoa para fixar o corpo.",
+            CYAN, "9sp", True
+        )
+        ev_texts.add_widget(self.evidence_count_lbl)
+        ev_texts.add_widget(self.target_status_lbl)
+        evidence_bar.add_widget(ev_texts)
+        clear_target_btn = self._button("LIMPAR ALVO", self.clear_body_target)
+        clear_target_btn.size_hint_x = None
+        clear_target_btn.width = dp(118)
+        clear_target_btn.font_size = "10sp"
+        evidence_bar.add_widget(clear_target_btn)
         left.add_widget(evidence_bar)
         main.add_widget(left)
 
@@ -1160,7 +1272,7 @@ class NR17Screen(BoxLayout):
         full.add_widget(exit_btn)
 
         info = Label(
-            text="NR-17 · análise e evidências continuam ativas",
+            text="NR-17 · toque no tronco para fixar o corpo · análise ativa",
             size_hint=(None, None), size=(dp(360), dp(42)),
             pos_hint={"x": 0.015, "top": 0.985},
             color=(0.94, 0.98, 1, 0.92), bold=True, font_size="12sp",
@@ -1210,6 +1322,145 @@ class NR17Screen(BoxLayout):
         self.status_text = "Câmera voltou ao modo painel."
         Clock.schedule_once(lambda dt: self._fit_preview(), 0.05)
         Clock.schedule_once(lambda dt: self._fit_preview(), 0.25)
+
+    # --------------------------- Alvo corporal por toque ---------------------------
+    def _set_body_target_from_touch(self, x, y):
+        """Converte o toque da tela para coordenada normalizada no preview."""
+        try:
+            rx, ry, rw, rh = self._preview_image_rect()
+            if rw <= 2 or rh <= 2:
+                return
+            if not (rx <= x <= rx + rw and ry <= y <= ry + rh):
+                return
+            xn = clamp((float(x) - rx) / rw, 0.0, 1.0)
+            yn = clamp(1.0 - ((float(y) - ry) / rh), 0.0, 1.0)
+            self.body_target = (xn, yn)
+            self.body_target_active = True
+            self.body_target_state = "waiting"
+            self.body_target_last_distance = None
+            if self.target_overlay:
+                self.target_overlay.set_target(self.body_target, "waiting")
+            self._refresh_target_status()
+            self.status_text = "Alvo corporal fixado · mantenha ombro, quadril e pernas visiveis."
+        except Exception as exc:
+            self.status_text = f"Nao foi possivel fixar o alvo corporal: {exc}"
+
+    def clear_body_target(self, *_args, show_status=True):
+        self.body_target = None
+        self.body_target_active = False
+        self.body_target_state = "idle"
+        self.body_target_body_pct = 0.0
+        self.body_target_last_distance = None
+        if self.target_overlay:
+            self.target_overlay.clear_target()
+        self._refresh_target_status()
+        if show_status:
+            self.status_text = "Rastreamento automatico restaurado. Toque no corpo para fixar novamente."
+
+    def _refresh_target_status(self):
+        lbl = getattr(self, "target_status_lbl", None)
+        if lbl is None:
+            return
+        if not self.body_target_active:
+            lbl.text = "ALVO: AUTOMÁTICO · toque no tronco da pessoa para fixar o corpo."
+            lbl.color = CYAN
+            return
+        pct = float(self.body_target_body_pct or 0.0)
+        if self.body_target_state == "locked":
+            lbl.text = f"ALVO: FIXADO ✓ · corpo {pct:.0f}% · rastreamento acompanhando o tronco."
+            lbl.color = GREEN
+        elif self.body_target_state == "lost":
+            lbl.text = f"ALVO: PERDIDO · corpo {pct:.0f}% · reenquadre a pessoa ou toque novamente."
+            lbl.color = RED
+        else:
+            lbl.text = f"ALVO: AGUARDANDO · corpo {pct:.0f}% · mostre quadril e pernas."
+            lbl.color = YELLOW
+
+    def _landmark_preview_norm(self, landmarks, name):
+        obj = (landmarks or {}).get(name)
+        if not obj:
+            return None
+        pt = source_xy(obj)
+        if pt is None:
+            return None
+        return transform_preview_xy(
+            pt[0], pt[1], self.camera_preview_rotation, self.mirror_x, self.mirror_y
+        )
+
+    def _mean_preview_points(self, points):
+        pts = [p for p in points if p is not None]
+        if not pts:
+            return None
+        return (
+            sum(float(p[0]) for p in pts) / len(pts),
+            sum(float(p[1]) for p in pts) / len(pts),
+        )
+
+    def _body_center_preview(self, landmarks):
+        shoulders = self._mean_preview_points([
+            self._landmark_preview_norm(landmarks, "left_shoulder"),
+            self._landmark_preview_norm(landmarks, "right_shoulder"),
+        ])
+        hips = self._mean_preview_points([
+            self._landmark_preview_norm(landmarks, "left_hip"),
+            self._landmark_preview_norm(landmarks, "right_hip"),
+        ])
+        if shoulders is None or hips is None:
+            return None
+        # Centro do tronco e uma ancora mais estavel que cabeca/ombros isolados.
+        return ((shoulders[0] + hips[0]) / 2.0, (shoulders[1] + hips[1]) / 2.0)
+
+    def _body_completeness(self, landmarks):
+        """Rejeita o caso que motivou a melhoria: apenas cabeca/ombros detectados."""
+        lm = landmarks or {}
+        shoulder = bool(lm.get("left_shoulder") or lm.get("right_shoulder"))
+        hip = bool(lm.get("left_hip") or lm.get("right_hip"))
+        knee = bool(lm.get("left_knee") or lm.get("right_knee"))
+        ankle = bool(lm.get("left_ankle") or lm.get("right_ankle"))
+        groups = (shoulder, hip, knee, ankle)
+        body_pct = 25.0 * sum(1 for ok in groups if ok)
+        # Para uma leitura postural valida precisamos do tronco e de pelo menos
+        # uma referencia dos membros inferiores. Tornozelo pode estar oculto,
+        # portanto joelho OU tornozelo e suficiente.
+        complete = shoulder and hip and (knee or ankle) and body_pct >= BODY_TARGET_MIN_BODY_PCT
+        return bool(complete), float(body_pct)
+
+    def _update_body_target_tracking(self, landmarks, body_complete, body_pct):
+        self.body_target_body_pct = float(body_pct or 0.0)
+        center = self._body_center_preview(landmarks)
+
+        if not self.body_target_active:
+            self.body_target_state = "idle"
+            self._refresh_target_status()
+            return bool(body_complete)
+
+        if not body_complete or center is None or self.body_target is None:
+            self.body_target_state = "waiting"
+            if self.target_overlay:
+                self.target_overlay.set_target(self.body_target, "waiting")
+            self._refresh_target_status()
+            return False
+
+        dist = math.hypot(center[0] - self.body_target[0], center[1] - self.body_target[1])
+        self.body_target_last_distance = float(dist)
+        if dist > BODY_TARGET_MAX_DISTANCE:
+            self.body_target_state = "lost"
+            if self.target_overlay:
+                self.target_overlay.set_target(self.body_target, "lost")
+            self._refresh_target_status()
+            return False
+
+        # Uma vez associado, o alvo acompanha suavemente o centro do tronco.
+        a = BODY_TARGET_TRACK_ALPHA
+        self.body_target = (
+            clamp((1.0-a) * self.body_target[0] + a * center[0], 0.0, 1.0),
+            clamp((1.0-a) * self.body_target[1] + a * center[1], 0.0, 1.0),
+        )
+        self.body_target_state = "locked"
+        if self.target_overlay:
+            self.target_overlay.set_target(self.body_target, "locked")
+        self._refresh_target_status()
+        return True
 
     # --------------------------- Android / ML Kit ---------------------------
     def _request_camera_permission(self):
@@ -1271,8 +1522,18 @@ class NR17Screen(BoxLayout):
 
         self.overlay = PoseOverlay()
         self.overlay.set_transform(self.camera_preview_rotation, self.mirror_x, self.mirror_y)
+        if self.target_overlay is None:
+            self.target_overlay = BodyTargetOverlay()
+        try:
+            if self.target_overlay.parent is not None:
+                self.target_overlay.parent.remove_widget(self.target_overlay)
+        except Exception:
+            pass
         self.preview_area.add_widget(self.scatter)
         self.preview_area.add_widget(self.overlay)
+        self.preview_area.add_widget(self.target_overlay)
+        if self.body_target_active and self.body_target is not None:
+            self.target_overlay.set_target(self.body_target, self.body_target_state)
         if not self._preview_fit_bound:
             self.preview_area.bind(size=self._fit_preview, pos=self._fit_preview)
             self._preview_fit_bound = True
@@ -1322,7 +1583,12 @@ class NR17Screen(BoxLayout):
         self.overlay.pos = self.preview_area.pos
         self.overlay.size = self.preview_area.size
         self.overlay.set_transform(self.camera_preview_rotation, self.mirror_x, self.mirror_y)
-        self.overlay.set_image_rect(*self._preview_image_rect())
+        image_rect = self._preview_image_rect()
+        self.overlay.set_image_rect(*image_rect)
+        if self.target_overlay:
+            self.target_overlay.pos = self.preview_area.pos
+            self.target_overlay.size = self.preview_area.size
+            self.target_overlay.set_image_rect(*image_rect)
 
     def _destroy_camera_widget(self):
         """Libera completamente o provider da camera para permitir PARAR -> INICIAR no Android."""
@@ -1539,6 +1805,12 @@ class NR17Screen(BoxLayout):
             self.quality_lbl.text = "SEM CORPO"
             self.quality_lbl.color = YELLOW
             self.detail_lbl.text = f"ML Kit {data.get('inferenceMs', 0)} ms"
+            if self.body_target_active:
+                self.body_target_state = "waiting"
+                self.body_target_body_pct = 0.0
+                if self.target_overlay:
+                    self.target_overlay.set_target(self.body_target, "waiting")
+                self._refresh_target_status()
             return
 
         raw_landmarks = data.get("landmarks") or {}
@@ -1552,18 +1824,36 @@ class NR17Screen(BoxLayout):
         now = time.monotonic()
         dt = clamp(now - self.last_metrics_tick, 0.0, 0.4)
         self.last_metrics_tick = now
-        self.last_valid_pose_time = now
-        if values.get("trunk") is not None and values.get("neck") is not None:
+
+        body_complete, body_pct = self._body_completeness(landmarks)
+        target_ok = self._update_body_target_tracking(landmarks, body_complete, body_pct)
+        geometry_ok = values.get("trunk") is not None and values.get("neck") is not None
+        valid = bool(
+            quality >= 55.0 and len(landmarks) >= 6 and geometry_ok and
+            body_complete and target_ok
+        )
+
+        if valid:
+            self.last_valid_pose_time = now
             self._accumulate(values, dt)
         else:
             self.invalid_time += dt
         self.last_values = values
 
-        valid = quality >= 55.0 and len(landmarks) >= 6
         if self.overlay:
             self.overlay.set_image_rect(*self._preview_image_rect())
             self.overlay.set_pose(landmarks, valid=valid)
         self._update_ui(data, landmarks, values, quality, coverage)
+
+        # Mensagem operacional quando o detector encolhe para cabeca/ombros.
+        if not body_complete:
+            self.quality_lbl.text = "CORPO PARCIAL"
+            self.quality_lbl.color = YELLOW
+            self.detail_lbl.text = f"corpo {body_pct:.0f}% · recue/reenquadre para mostrar quadril e pernas"
+        elif self.body_target_active and not target_ok:
+            self.quality_lbl.text = "ALVO PERDIDO" if self.body_target_state == "lost" else "AGUARDANDO"
+            self.quality_lbl.color = RED if self.body_target_state == "lost" else YELLOW
+            self.detail_lbl.text = f"corpo {body_pct:.0f}% · toque novamente no tronco se necessario"
 
         # Avalia evidências somente depois que o overlay já está atualizado,
         # garantindo que a foto automática corresponda exatamente à postura atual.
@@ -1689,6 +1979,9 @@ class NR17Screen(BoxLayout):
                 "angle_min_confidence": ANGLE_MIN_CONFIDENCE,
                 "confirm_frames": LANDMARK_CONFIRM_FRAMES,
                 "jump_limit": LANDMARK_JUMP_LIMIT,
+                "rastreamento_corporal": "toque" if self.body_target_active else "automatico",
+                "corpo_minimo_pct": BODY_TARGET_MIN_BODY_PCT,
+                "alvo_distancia_max": BODY_TARGET_MAX_DISTANCE,
             },
         }
 
@@ -1811,13 +2104,23 @@ class NR17Screen(BoxLayout):
         self._fit_preview()
         if self.overlay:
             self.overlay.redraw()
+        # O alvo de operacao e util na tela, mas nao deve aparecer na evidencia tecnica.
+        target_opacity = None
         try:
+            if self.target_overlay is not None:
+                target_opacity = self.target_overlay.opacity
+                self.target_overlay.opacity = 0
             self.preview_area.export_to_png(str(temp_path))
             if not temp_path.exists():
                 raise RuntimeError("Kivy nao gerou a captura do preview.")
             with Image.open(temp_path) as raw:
                 return raw.convert("RGB")
         finally:
+            try:
+                if self.target_overlay is not None and target_opacity is not None:
+                    self.target_overlay.opacity = target_opacity
+            except Exception:
+                pass
             try:
                 if temp_path.exists():
                     temp_path.unlink()
@@ -3205,8 +3508,9 @@ class NR17Screen(BoxLayout):
         self._auto_evidence_busy = False
         self._auto_evidence_last_capture = 0.0
         self._landmark_state = {}; self._landmark_streak = {}
+        self.clear_body_target(show_status=False)
         self._refresh_evidence_count()
-        self.status_text = "Nova avaliação iniciada."
+        self.status_text = "Nova avaliação iniciada · toque no tronco para fixar o corpo, se desejar."
         for key, card in self.metrics.items():
             card.set("--")
         if self.overlay:
