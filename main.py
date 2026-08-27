@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.11
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.12
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.12"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -108,6 +108,7 @@ DEFAULT_MIRROR_Y = env_bool("CAMERA_PREVIEW_MIRROR_Y", False)
 
 CAM_W = env_int("CAMERA_WIDTH", 1280)
 CAM_H = env_int("CAMERA_HEIGHT", 720)
+CAMERA_RESTART_DELAY = max(0.25, min(2.0, env_float("CAMERA_RESTART_DELAY", 0.65)))
 POSE_LONG_SIDE = env_int("POSE_INPUT_LONG_SIDE", 640)
 POSE_INTERVAL = max(0.08, env_float("POSE_INTERVAL", 0.12))
 MIN_CONFIDENCE = max(0.25, min(0.95, env_float("POSE_MIN_CONFIDENCE", 0.45)))
@@ -804,8 +805,8 @@ class NR17Screen(BoxLayout):
         self.evidence_records = []
         self.last_exported_report = None
 
-        # Analise multimodal Gemini. A IA nao recalcula RULA/REBA/IRE;
-        # ela interpreta o ambiente e sugere acoes usando os dados medidos.
+        # Interpretacao complementar multimodal. Os calculos RULA/REBA/IRE permanecem locais;
+        # o servico externo interpreta o ambiente e sugere acoes usando os dados medidos.
         self.ai_analysis = None
         self.ai_model_used = None
         self.ai_last_error = None
@@ -822,6 +823,9 @@ class NR17Screen(BoxLayout):
         self._landmark_streak = {}
         self._frame_worker_busy = False
         self._running = False
+        self._camera_restart_pending = False
+        self._camera_stopped_at = 0.0
+        self._preview_fit_bound = False
 
         # Modo câmera em tela cheia: reutiliza o MESMO preview/overlay,
         # portanto a análise, as evidências automáticas e a calibração continuam ativas.
@@ -1047,7 +1051,7 @@ class NR17Screen(BoxLayout):
         header = Card(size_hint_y=None, height=dp(62), padding=dp(10), spacing=dp(10))
         title_box = BoxLayout(orientation="vertical")
         title_box.add_widget(self._label("NR-17 | ERGONOMIA POR VISÃO", CYAN, "20sp", True))
-        title_box.add_widget(self._label(f"ML Kit local · evidências críticas · Gemini multimodal · PDF · v{APP_VERSION}", MUTED, "11sp"))
+        title_box.add_widget(self._label(f"ML Kit local · evidências críticas · interpretação assistida · PDF · v{APP_VERSION}", MUTED, "11sp"))
         self.status_lbl = self._label(self.status_text, YELLOW, "11sp", True)
         self.bind(status_text=lambda *_: setattr(self.status_lbl, "text", self.status_text))
         header.add_widget(title_box)
@@ -1072,7 +1076,7 @@ class NR17Screen(BoxLayout):
         controls.add_widget(self._button("INICIAR", self.start_camera, primary=True))
         controls.add_widget(self._button("PARAR", self.stop_camera))
         controls.add_widget(self._button("CICLO", self.toggle_cycle))
-        self.report_btn = self._button("RELATÓRIO + IA", self.generate_report, primary=True)
+        self.report_btn = self._button("RELATÓRIO COMPLETO", self.generate_report, primary=True)
         controls.add_widget(self.report_btn)
         controls.add_widget(self._button("TELA CHEIA", self.open_fullscreen_camera))
         controls.add_widget(self._button("⚙ CÂMERA", self.open_calibration))
@@ -1269,7 +1273,9 @@ class NR17Screen(BoxLayout):
         self.overlay.set_transform(self.camera_preview_rotation, self.mirror_x, self.mirror_y)
         self.preview_area.add_widget(self.scatter)
         self.preview_area.add_widget(self.overlay)
-        self.preview_area.bind(size=self._fit_preview, pos=self._fit_preview)
+        if not self._preview_fit_bound:
+            self.preview_area.bind(size=self._fit_preview, pos=self._fit_preview)
+            self._preview_fit_bound = True
         Clock.schedule_once(lambda dt: self._fit_preview(), 0.1)
 
     def _preview_image_rect(self):
@@ -1318,32 +1324,100 @@ class NR17Screen(BoxLayout):
         self.overlay.set_transform(self.camera_preview_rotation, self.mirror_x, self.mirror_y)
         self.overlay.set_image_rect(*self._preview_image_rect())
 
-    def start_camera(self, *_):
+    def _destroy_camera_widget(self):
+        """Libera completamente o provider da camera para permitir PARAR -> INICIAR no Android."""
+        old_camera = self.camera
+        old_scatter = self.scatter
+        old_overlay = self.overlay
+
+        self._running = False
+        Clock.unschedule(self._analysis_tick)
+        Clock.unschedule(self._poll_pose_result)
+
+        try:
+            if old_camera is not None:
+                old_camera.play = False
+        except Exception:
+            pass
+
+        # Alguns providers Android mantem a Camera nativa presa mesmo apos play=False.
+        # Tenta encerrar o CoreCamera explicitamente; se o provider nao expuser stop(),
+        # a remocao do widget e a perda das referencias ainda forcam a recriacao.
+        try:
+            core = getattr(old_camera, "_camera", None) if old_camera is not None else None
+            if core is not None and hasattr(core, "stop"):
+                core.stop()
+        except Exception:
+            pass
+
+        for widget in (old_overlay, old_scatter):
+            try:
+                if widget is not None and widget.parent is not None:
+                    widget.parent.remove_widget(widget)
+            except Exception:
+                pass
+
+        self.camera = None
+        self.scatter = None
+        self.overlay = None
+        self._frame_worker_busy = False
+        self.last_pose_seq = -1
+        self.last_pose_data = None
+        self._landmark_state = {}
+        self._landmark_streak = {}
+
+    def _activate_camera_after_release(self, _dt=0):
+        self._camera_restart_pending = False
+        if self._running:
+            return
         if self.camera is None:
             self._init_camera_widget()
         if self.camera is None:
+            self.status_text = "Nao foi possivel reabrir a camera. Tente novamente."
             return
         try:
             self.camera.play = True
             self._running = True
-            self.status_text = "Câmera local ativa · análise local em segundo plano."
+            self.last_metrics_tick = time.monotonic()
+            self.status_text = "Camera local ativa · analise postural em segundo plano."
             Clock.unschedule(self._analysis_tick)
             Clock.unschedule(self._poll_pose_result)
             Clock.schedule_interval(self._analysis_tick, POSE_INTERVAL)
             Clock.schedule_interval(self._poll_pose_result, 0.08)
+            Clock.schedule_once(lambda dt: self._fit_preview(), 0.08)
+            Clock.schedule_once(lambda dt: self._fit_preview(), 0.35)
         except Exception as exc:
-            self.status_text = f"Falha ao iniciar câmera: {exc}"
+            self._running = False
+            self.status_text = f"Falha ao iniciar camera: {exc}"
+
+    def start_camera(self, *_):
+        if self._running:
+            self.status_text = "Camera ja esta ativa."
+            return
+        if self._camera_restart_pending:
+            self.status_text = "Reabrindo camera..."
+            return
+
+        # Garante um pequeno intervalo para o Android liberar o hardware apos PARAR.
+        elapsed = time.monotonic() - float(self._camera_stopped_at or 0.0)
+        wait = max(0.0, CAMERA_RESTART_DELAY - elapsed) if self._camera_stopped_at else 0.0
+        if self.camera is None and wait > 0:
+            self._camera_restart_pending = True
+            self.status_text = "Reabrindo camera..."
+            Clock.unschedule(self._activate_camera_after_release)
+            Clock.schedule_once(self._activate_camera_after_release, wait)
+            return
+        self._activate_camera_after_release(0)
 
     def stop_camera(self, *_):
         self._running = False
+        self._camera_restart_pending = False
+        Clock.unschedule(self._activate_camera_after_release)
         Clock.unschedule(self._analysis_tick)
         Clock.unschedule(self._poll_pose_result)
-        try:
-            if self.camera:
-                self.camera.play = False
-        except Exception:
-            pass
-        self.status_text = "Câmera parada."
+        self._destroy_camera_widget()
+        self._camera_stopped_at = time.monotonic()
+        self.status_text = "Camera parada · toque INICIAR para reabrir."
 
     # --------------------------- Frame -> ML Kit ---------------------------
     def _analysis_tick(self, _dt):
@@ -1597,13 +1671,15 @@ class NR17Screen(BoxLayout):
             "max_ire": int(self.max_ire),
             "max_rula": int(self.max_rula),
             "max_reba": int(self.max_reba),
+            "qualidade_pose_atual_pct": round(float(self.last_quality or 0), 1),
+            "cobertura_pose_atual_pct": round(float(self.last_coverage or 0), 1),
             "ultimo": v,
             "pico": dict(self.peak_values or v),
             "pico_em": self.peak_at,
             "evidencias": list(self._ordered_evidence_records()),
             "modo_evidencia": "automatica_mais_critica_por_fator",
-            "analise_ia": self.ai_analysis,
-            "modelo_ia": self.ai_model_used,
+            "analise_assistida": self.ai_analysis,
+            "motor_analise": self.ai_model_used,
             "config": {
                 "camera_preview_rotation": self.camera_preview_rotation,
                 "pose_rotation": self.pose_rotation,
@@ -1850,7 +1926,7 @@ class NR17Screen(BoxLayout):
         nomes = ", ".join(c["label"] for c in candidates)
         self.status_text = f"Evidencia critica atualizada automaticamente: {nomes}."
 
-    # --------------------------- Gemini multimodal ---------------------------
+    # --------------------------- Interpretacao complementar ---------------------------
     def _gemini_url(self, model):
         return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -1873,7 +1949,7 @@ class NR17Screen(BoxLayout):
     def _normalise_ai_analysis(self, data):
         """Limita e normaliza a resposta para o PDF nunca estourar visualmente."""
         if not isinstance(data, dict):
-            raise ValueError("Resposta da IA nao e um objeto JSON.")
+            raise ValueError("Resposta da analise complementar nao e um objeto JSON.")
 
         factors = []
         raw_factors = data.get("fatores") or []
@@ -2011,35 +2087,47 @@ class NR17Screen(BoxLayout):
         except Exception:
             return None
 
-    def _build_gemini_payload(self, snapshot, evidencias):
+    def _build_gemini_payload(self, snapshot, evidencias, include_images=True):
         parts = [{"text": self._build_ai_prompt(snapshot, evidencias)}]
         image_count = 0
-        for rec in evidencias[:GEMINI_MAX_IMAGES]:
-            image_part = self._prepare_gemini_image_part(rec)
-            if not image_part:
-                continue
-            factor = str(rec.get("factor_label") or rec.get("factor") or "GERAL").upper()
-            side = str(rec.get("factor_side") or "").strip()
-            value = rec.get("factor_value")
-            parts.append({"text": f"EVIDENCIA VISUAL CRITICA: {factor}{' '+side if side else ''} | valor medido {value}"})
-            parts.append(image_part)
-            image_count += 1
 
-        # Se nenhum fator gerou evidencia, envia o preview atual somente como contexto ambiental.
-        if image_count == 0 and self.camera and self.camera.texture is not None:
-            try:
-                ctx = self._capture_preview_composed()
-                long_side = max(ctx.size)
-                if long_side > GEMINI_IMAGE_LONG_SIDE:
-                    scale = GEMINI_IMAGE_LONG_SIDE / float(long_side)
-                    res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-                    ctx = ctx.resize((max(2, int(ctx.width*scale)), max(2, int(ctx.height*scale))), res)
-                buf = io.BytesIO()
-                ctx.save(buf, format="JPEG", quality=GEMINI_IMAGE_QUALITY, optimize=True)
-                parts.append({"text": "IMAGEM DE CONTEXTO DO POSTO: nenhuma evidencia critica automatica foi registrada."})
-                parts.append({"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}})
-            except Exception:
-                pass
+        if not include_images:
+            parts.append({
+                "text": (
+                    "MODO DE CONTINGENCIA: as imagens nao estao disponiveis para esta tentativa. "
+                    "Baseie a interpretacao EXCLUSIVAMENTE nos dados medidos fornecidos. "
+                    "Nao descreva bancada, layout, alcance, iluminacao, objetos ou qualquer caracteristica "
+                    "do ambiente que nao esteja explicitamente informada nos dados. Registre essa limitacao."
+                )
+            })
+        else:
+            for rec in evidencias[:GEMINI_MAX_IMAGES]:
+                image_part = self._prepare_gemini_image_part(rec)
+                if not image_part:
+                    continue
+                factor = str(rec.get("factor_label") or rec.get("factor") or "GERAL").upper()
+                side = str(rec.get("factor_side") or "").strip()
+                value = rec.get("factor_value")
+                parts.append({"text": f"EVIDENCIA VISUAL CRITICA: {factor}{' '+side if side else ''} | valor medido {value}"})
+                parts.append(image_part)
+                image_count += 1
+
+            # Se nenhum fator gerou evidencia, usa o preview atual como contexto ambiental.
+            if image_count == 0 and self.camera and self.camera.texture is not None:
+                try:
+                    ctx = self._capture_preview_composed()
+                    long_side = max(ctx.size)
+                    if long_side > GEMINI_IMAGE_LONG_SIDE:
+                        scale = GEMINI_IMAGE_LONG_SIDE / float(long_side)
+                        res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                        ctx = ctx.resize((max(2, int(ctx.width*scale)), max(2, int(ctx.height*scale))), res)
+                    buf = io.BytesIO()
+                    ctx.save(buf, format="JPEG", quality=GEMINI_IMAGE_QUALITY, optimize=True)
+                    parts.append({"text": "IMAGEM DE CONTEXTO DO POSTO: nenhuma evidencia critica automatica foi registrada."})
+                    parts.append({"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}})
+                    image_count += 1
+                except Exception:
+                    pass
 
         payload = {
             "contents": [{"role": "user", "parts": parts}],
@@ -2057,14 +2145,14 @@ class NR17Screen(BoxLayout):
         if raw.startswith("```"):
             raw = raw.replace("```json", "", 1).replace("```", "").strip()
         if not raw:
-            raise ValueError("Gemini retornou resposta vazia.")
+            raise ValueError("Servico retornou resposta vazia.")
         return self._normalise_ai_analysis(json.loads(raw))
 
     def _save_ai_analysis(self):
         if not self.ai_analysis:
             return None
         try:
-            path = self._assessment_dir() / "analise_ia.json"
+            path = self._assessment_dir() / "analise_assistida.json"
             payload = dict(self.ai_analysis)
             payload["modelo"] = self.ai_model_used
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2104,7 +2192,7 @@ class NR17Screen(BoxLayout):
                 "payload_bytes": len(payload or b""),
                 "imagens": min(len(evidencias or []), GEMINI_MAX_IMAGES),
             }
-            path = self._assessment_dir() / "erro_ia.json"
+            path = self._assessment_dir() / "erro_analise.json"
             path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
             return path
         except Exception:
@@ -2115,23 +2203,23 @@ class NR17Screen(BoxLayout):
         api_status = str(api_status or "").upper()
         detail = str(detail or "").strip()
         if status == 429 or api_status == "RESOURCE_EXHAUSTED":
-            return "Limite gratuito/quota da Gemini atingido (HTTP 429)."
+            return "Limite gratuito/quota do servico atingido (HTTP 429)."
         if status == 400 or api_status == "INVALID_ARGUMENT":
-            return "Requisicao da Gemini recusada por formato/dados (HTTP 400)."
+            return "Requisicao recusada por formato/dados (HTTP 400)."
         if status == 403 or api_status == "PERMISSION_DENIED":
-            return "Chave/projeto Gemini sem permissao (HTTP 403)."
+            return "Credencial do servico sem permissao (HTTP 403)."
         if status == 404 or api_status == "NOT_FOUND":
-            return "Modelo Gemini indisponivel para esta chave (HTTP 404)."
+            return "Motor de analise indisponivel para esta credencial (HTTP 404)."
         if status in (500, 502, 503, 504):
-            return f"Servico Gemini temporariamente indisponivel (HTTP {status})."
-        return f"Falha Gemini HTTP {status or 0}." + (f" {detail[:120]}" if detail else "")
+            return f"Servico de interpretacao temporariamente indisponivel (HTTP {status})."
+        return f"Falha do servico HTTP {status or 0}." + (f" {detail[:120]}" if detail else "")
 
-    def _request_ai_for_report(self, snapshot, evidencias, model_index=0, retry_index=0, payload=None):
+    def _request_ai_for_report(self, snapshot, evidencias, model_index=0, retry_index=0, payload=None, text_only=False):
         if payload is None:
-            payload = self._build_gemini_payload(snapshot, evidencias)
+            payload = self._build_gemini_payload(snapshot, evidencias, include_images=not text_only)
         model_index = max(0, min(model_index, len(GEMINI_MODELS) - 1))
         model = GEMINI_MODELS[model_index]
-        self.status_text = f"IA analisando ambiente e evidencias · {model}..."
+        self.status_text = f"Analisando ambiente e evidencias..."
         token = self._ai_request_token
 
         def ok(req, res):
@@ -2139,17 +2227,19 @@ class NR17Screen(BoxLayout):
                 return
             try:
                 analysis = self._parse_gemini_response(res)
+                analysis["fonte_analise"] = "somente_dados" if text_only else "dados_e_evidencias"
                 self.ai_analysis = analysis
                 self.ai_model_used = model
                 self.ai_last_error = None
                 self._save_ai_analysis()
-                snapshot["analise_ia"] = analysis
-                snapshot["modelo_ia"] = model
+                snapshot["analise_assistida"] = analysis
+                snapshot["motor_analise"] = model
+                snapshot["fonte_analise"] = analysis.get("fonte_analise")
                 self._save_assessment_json()
                 self._ai_request_active = False
                 Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis), 0)
             except Exception as exc:
-                self._handle_ai_final_error(snapshot, evidencias, f"Resposta invalida da IA: {exc}")
+                self._handle_ai_final_error(snapshot, evidencias, f"Resposta invalida da analise complementar: {exc}")
 
         def fail(req, res):
             if token != self._ai_request_token:
@@ -2158,11 +2248,19 @@ class NR17Screen(BoxLayout):
             status, api_status, detail = self._gemini_error_info(res, raw_status)
             self._save_ai_error(model, status, api_status, detail, payload, evidencias)
 
+            # Se o problema estiver no conteudo multimodal, repete automaticamente somente com dados.
+            if (status == 400 or api_status.upper() == "INVALID_ARGUMENT") and not text_only:
+                self.status_text = "Analise visual indisponivel · repetindo somente com os dados medidos..."
+                Clock.schedule_once(
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, 0, None, True), 0.5
+                )
+                return
+
             # 429: tenta o outro modelo do free tier imediatamente antes de esperar.
             if (status == 429 or api_status.upper() == "RESOURCE_EXHAUSTED") and model_index + 1 < len(GEMINI_MODELS) and retry_index == 0:
-                self.status_text = f"Limite/quota no {model} · tentando {GEMINI_MODELS[model_index + 1]}..."
+                self.status_text = "Limite do servico atingido · tentando rota alternativa..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload, text_only), 0.8
                 )
                 return
 
@@ -2170,18 +2268,18 @@ class NR17Screen(BoxLayout):
             if status in (429, 500, 502, 503, 504) and retry_index < len(GEMINI_RETRY_DELAYS):
                 delay = GEMINI_RETRY_DELAYS[retry_index]
                 label = "limite/quota" if status == 429 else "servico temporariamente indisponivel"
-                self.status_text = f"Gemini: {label} · nova tentativa em {int(delay)}s..."
+                self.status_text = f"Servico de interpretacao: {label} · nova tentativa em {int(delay)}s..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload),
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload, text_only),
                     delay,
                 )
                 return
 
             # Modelo inexistente: troca de modelo; 400/403 não adianta repetir cegamente.
             if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 500, 502, 503, 504):
-                self.status_text = f"Tentando modelo alternativo: {GEMINI_MODELS[model_index + 1]}..."
+                self.status_text = "Tentando rota alternativa de interpretacao..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload, text_only), 0.8
                 )
                 return
 
@@ -2196,15 +2294,15 @@ class NR17Screen(BoxLayout):
                 return
             if retry_index < len(GEMINI_RETRY_DELAYS):
                 delay = GEMINI_RETRY_DELAYS[retry_index]
-                self.status_text = f"Sem resposta da Gemini · tentando novamente em {int(delay)}s..."
+                self.status_text = f"Sem resposta do servico · tentando novamente em {int(delay)}s..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload),
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload, text_only),
                     delay,
                 )
                 return
             if model_index + 1 < len(GEMINI_MODELS):
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload, text_only), 0.8
                 )
                 return
             self._handle_ai_final_error(snapshot, evidencias, f"Falha de rede: {err}")
@@ -2224,7 +2322,7 @@ class NR17Screen(BoxLayout):
         self.ai_analysis = None
         self.ai_model_used = None
         self._ai_request_active = False
-        self.status_text = f"IA falhou: {self.ai_last_error} · gerando PDF tecnico..."
+        self.status_text = f"Analise complementar indisponivel: {self.ai_last_error} · gerando PDF tecnico..."
         Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
 
     # --------------------------- PDF ---------------------------
@@ -2381,17 +2479,17 @@ class NR17Screen(BoxLayout):
         d.rounded_rectangle((82, y, 1572, y + 175), radius=22, fill=(236, 243, 247), outline=line, width=2)
         d.text((108, y + 22), "LEITURA DO RESULTADO", font=fonts["label"], fill=navy2)
         note = (
-            "IRE, RULA e REBA sao calculos assistidos por visao computacional. "
+            "RULA e REBA sao referencias posturais padronizadas; o IRE e um indicador interno de exposicao do sistema. "
             "O resultado apoia a AEP/AET e deve ser validado considerando carga, forca, pega, repetitividade e contexto real da atividade."
         )
         draw_wrapped(d, note, (108, y + 62), fonts["small"], gray, 1400, line_gap=7)
 
         d.line((82, 2260, 1572, 2260), fill=line, width=2)
         d.text((82, 2280), "Pagina 1 | Resumo executivo", font=fonts["tiny"], fill=gray)
-        footer_next = "Detalhe postural na pagina 2"
-        if snapshot.get("analise_ia"):
-            footer_next += " · Analise IA nas paginas seguintes"
-        d.text((945, 2280), footer_next, font=fonts["tiny"], fill=navy2)
+        footer_next = "Detalhe p.2 · Metodologia p.3 · Qualidade/escopo p.4"
+        if snapshot.get("analise_assistida"):
+            footer_next += " · Interpretacao a partir da p.5"
+        d.text((760, 2280), footer_next, font=fonts["tiny"], fill=navy2)
         return page
 
     def _pdf_posture_page(self, snapshot, total_pages):
@@ -2497,6 +2595,189 @@ class NR17Screen(BoxLayout):
         d.text((1070, 2280), f"Total do relatorio: {total_pages} paginas", font=fonts["tiny"], fill=navy2)
         return page
 
+    def _rula_reference_text(self, score):
+        score = int(score or 0)
+        if score <= 0:
+            return "Nao calculado"
+        if score <= 2:
+            return "Nivel 1 · postura geralmente aceitavel se nao mantida/repetida"
+        if score <= 4:
+            return "Nivel 2 · investigar; mudancas podem ser necessarias"
+        if score <= 6:
+            return "Nivel 3 · investigar e promover mudancas em curto prazo"
+        return "Nivel 4 · investigar e promover mudancas imediatamente"
+
+    def _reba_reference_text(self, score):
+        score = int(score or 0)
+        if score <= 0:
+            return "Nao calculado"
+        if score == 1:
+            return "Risco negligenciavel · nenhuma acao normalmente necessaria"
+        if score <= 3:
+            return "Risco baixo · mudanca pode ser necessaria"
+        if score <= 7:
+            return "Risco medio · investigar e implementar mudancas"
+        if score <= 10:
+            return "Risco alto · investigar e implementar mudancas rapidamente"
+        return "Risco muito alto · implementar mudancas com urgencia"
+
+    def _capture_quality_protocol(self, snapshot):
+        records = list(snapshot.get("evidencias") or [])
+        qualities = [float(r.get("quality")) for r in records if r.get("quality") is not None]
+        coverages = [float(r.get("coverage")) for r in records if r.get("coverage") is not None]
+        q = (sum(qualities) / len(qualities)) if qualities else float(snapshot.get("qualidade_pose_atual_pct", 0) or 0)
+        c = (sum(coverages) / len(coverages)) if coverages else float(snapshot.get("cobertura_pose_atual_pct", 0) or 0)
+        t = float(snapshot.get("tempo_valido_s", 0) or 0)
+        n = len(records)
+        if q >= 80 and c >= 80 and t >= 60 and n >= 2:
+            level = "ALTA"
+            desc = "Registro visual consistente para triagem postural, sujeito a validacao do contexto real."
+        elif q >= 60 and c >= 60 and t >= 20:
+            level = "MODERADA"
+            desc = "Registro utilizavel para triagem; ampliar tempo/ciclos ou evidencias aumenta a robustez."
+        else:
+            level = "LIMITADA"
+            desc = "Interpretar com cautela e repetir a captura antes de conclusoes ou intervencoes relevantes."
+        return q, c, t, n, level, desc
+
+    def _pdf_methodology_page(self, snapshot, page_number, total_pages):
+        """Base metodologica: enquadramento regulatorio, metodos posturais e rastreabilidade."""
+        W, H = 1654, 2339
+        page = Image.new("RGB", (W, H), (246, 249, 251))
+        d = ImageDraw.Draw(page)
+        navy=(10,38,64); navy2=(18,62,96); cyan=(35,158,183); dark=(31,45,58); gray=(96,113,128); line=(215,225,233); white=(255,255,255)
+        fonts={
+            "title": load_report_font(60, True), "section": load_report_font(40, True),
+            "body": load_report_font(30, False), "body_b": load_report_font(30, True),
+            "label": load_report_font(25, True), "small": load_report_font(25, False),
+            "tiny": load_report_font(22, False),
+        }
+        d.rectangle((0,0,W,210), fill=navy); d.rectangle((0,200,W,210), fill=cyan)
+        d.text((82,48), "BASE METODOLOGICA E CRITERIOS", font=fonts["title"], fill=white)
+        d.text((86,132), "Triagem quantitativa/semiquantitativa de apoio a AEP/AET", font=fonts["small"], fill=(189,215,230))
+        d.text((1370,96), f"{page_number}/{total_pages}", font=fonts["body_b"], fill=white)
+
+        y=270
+        d.text((82,y), "ENQUADRAMENTO DO DOCUMENTO", font=fonts["section"], fill=navy); y+=66
+        d.rounded_rectangle((82,y,1572,y+300), radius=24, fill=white, outline=line, width=3)
+        text=(
+            "Este relatorio e um instrumento tecnico de triagem ergonomica e de apoio ao processo de AEP/AET. "
+            "Ele registra medidas posturais, tempo de exposicao e evidencias visuais de forma rastreavel. "
+            "Nao constitui, isoladamente, uma AET completa e nao substitui a analise da atividade, organizacao do trabalho, "
+            "forcas/cargas, repetitividade, variabilidade, participacao dos trabalhadores e validacao por profissional competente."
+        )
+        draw_wrapped(d,text,(112,y+38),fonts["body"],dark,1410,line_gap=9)
+        y+=355
+
+        d.text((82,y), "REFERENCIAS APLICADAS", font=fonts["section"], fill=navy); y+=66
+        refs=[
+            ("NR-17 · itens 17.3.1 e 17.3.1.1",
+             "A AEP deve identificar perigos e subsidiar medidas de prevencao; pode combinar abordagens qualitativas, semiquantitativas e quantitativas e deve ser registrada."),
+            ("RULA · McAtamney & Corlett, 1993",
+             "Metodo de investigacao postural para membros superiores, pescoco e tronco, com niveis de acao para orientar investigacao e intervencao."),
+            ("REBA · Hignett & McAtamney, 2000",
+             "Metodo de avaliacao postural do corpo inteiro, sensivel a posturas dinamicas/estaticas e usado para priorizacao de risco e necessidade de mudanca."),
+            ("ISO 11226:2000",
+             "Referencia tecnica para avaliacao de posturas estaticas, considerando angulos corporais e aspectos temporais. Uso como referencia; nao implica certificacao do sistema."),
+        ]
+        card_h=235
+        for title,body in refs:
+            d.rounded_rectangle((82,y,1572,y+card_h), radius=22, fill=(250,252,253), outline=line, width=2)
+            d.rectangle((82,y,92,y+card_h), fill=cyan)
+            d.text((116,y+26),title,font=fonts["body_b"],fill=navy2)
+            draw_wrapped(d,body,(116,y+78),fonts["small"],dark,1410,line_gap=7)
+            y+=card_h+20
+
+        y+=12
+        d.text((82,y), "CRITERIOS OBJETIVOS REGISTRADOS", font=fonts["section"], fill=navy); y+=62
+        left=["Angulos de tronco, pescoco, bracos e joelhos", "Tempo valido e percentual de exposicao por fator", "Pior postura/evidencia critica de cada fator"]
+        right=["RULA e REBA posturais assistidos", "Qualidade e cobertura da deteccao corporal", "Eventos, ciclos e configuracao da captura"]
+        d.rounded_rectangle((82,y,1572,y+285), radius=22, fill=(238,245,248), outline=line, width=2)
+        for col,items in enumerate((left,right)):
+            x=116 if col==0 else 840; yy=y+30
+            for item in items:
+                d.ellipse((x,yy+9,x+14,yy+23), fill=cyan)
+                yy=draw_wrapped(d,item,(x+30,yy),fonts["small"],dark,650,line_gap=6)+18
+        d.text((112, y + 245), "IRE = indicador interno de exposicao; nao e escala normativa da NR-17, RULA, REBA ou ISO 11226.", font=fonts["tiny"], fill=gray)
+        d.line((82,2260,1572,2260), fill=line, width=2)
+        d.text((82,2280), "Base metodologica | referencias e escopo de uso", font=fonts["tiny"], fill=gray)
+        return page
+
+    def _pdf_quality_scope_page(self, snapshot, page_number, total_pages):
+        """Qualidade do registro, leitura padronizada dos escores, limitacoes e conclusao."""
+        W,H=1654,2339
+        page=Image.new("RGB",(W,H),(246,249,251)); d=ImageDraw.Draw(page)
+        navy=(10,38,64); navy2=(18,62,96); cyan=(35,158,183); dark=(31,45,58); gray=(96,113,128); line=(215,225,233); white=(255,255,255)
+        fonts={
+            "title": load_report_font(60,True), "section": load_report_font(40,True),
+            "metric": load_report_font(54,True), "body": load_report_font(29,False), "body_b": load_report_font(29,True),
+            "label": load_report_font(24,True), "small": load_report_font(24,False), "tiny": load_report_font(22,False),
+        }
+        d.rectangle((0,0,W,210),fill=navy); d.rectangle((0,200,W,210),fill=cyan)
+        d.text((82,48),"QUALIDADE, ESCOPO E CONCLUSAO",font=fonts["title"],fill=white)
+        d.text((86,132),"Rastreabilidade da captura e limites de interpretacao",font=fonts["small"],fill=(189,215,230))
+        d.text((1370,96),f"{page_number}/{total_pages}",font=fonts["body_b"],fill=white)
+
+        q,c,t,n,level,desc=self._capture_quality_protocol(snapshot)
+        y=270
+        d.text((82,y),"QUALIDADE DO REGISTRO",font=fonts["section"],fill=navy); y+=68
+        vals=[("QUALIDADE",f"{q:.0f}%"),("COBERTURA",f"{c:.0f}%"),("TEMPO VALIDO",fmt_seconds(t)),("EVIDENCIAS",f"{n}/4")]
+        gap=18; cw=int((W-164-gap*3)/4)
+        for i,(lab,val) in enumerate(vals):
+            x=82+i*(cw+gap)
+            d.rounded_rectangle((x,y,x+cw,y+165),radius=20,fill=white,outline=line,width=2)
+            d.text((x+22,y+20),lab,font=fonts["label"],fill=gray)
+            d.text((x+22,y+67),val,font=fonts["metric"],fill=navy2)
+        y+=205
+        level_col=(46,160,104) if level=="ALTA" else (226,169,45) if level=="MODERADA" else (214,52,71)
+        d.rounded_rectangle((82,y,1572,y+205),radius=22,fill=white,outline=level_col,width=4)
+        d.rounded_rectangle((108,y+34,420,y+145),radius=18,fill=level_col)
+        d.text((145,y+66),level,font=fonts["section"],fill=white)
+        draw_wrapped(d,desc,(465,y+34),fonts["body_b"],dark,1050,line_gap=7)
+        d.text((465,y+130),"Classificacao interna da qualidade da captura; nao e escala da NR-17, RULA ou REBA.",font=fonts["small"],fill=gray)
+        y+=265
+
+        d.text((82,y),"LEITURA DOS METODOS POSTURAIS",font=fonts["section"],fill=navy); y+=66
+        rula=int(snapshot.get("max_rula",0) or 0); reba=int(snapshot.get("max_reba",0) or 0)
+        for lab,val,body in [
+            ("RULA",f"{rula}/7",self._rula_reference_text(rula)),
+            ("REBA",f"{reba}/15",self._reba_reference_text(reba)),
+        ]:
+            d.rounded_rectangle((82,y,1572,y+175),radius=22,fill=(250,252,253),outline=line,width=2)
+            d.text((112,y+24),lab,font=fonts["section"],fill=navy2)
+            d.text((350,y+25),val,font=fonts["metric"],fill=cyan)
+            draw_wrapped(d,body,(580,y+35),fonts["body_b"],dark,930,line_gap=6)
+            y+=195
+        d.text((112,y-8),"Observacao: carga/forca, pega e uso muscular devem ser confirmados em campo quando nao fornecidos ao sistema.",font=fonts["small"],fill=gray)
+        y+=52
+
+        d.text((82,y),"ESCOPO E LIMITACOES",font=fonts["section"],fill=navy); y+=64
+        limits=[
+            "Visao 2D pode sofrer efeito de perspectiva, oclusao, roupa, iluminacao e posicionamento da camera.",
+            "O sistema nao mede diretamente peso, forca, frequencia, repetitividade, demanda cognitiva ou organizacao do trabalho.",
+            "Os achados devem ser confrontados com a atividade real, variabilidade dos ciclos e participacao dos trabalhadores.",
+        ]
+        d.rounded_rectangle((82,y,1572,y+330),radius=22,fill=(238,245,248),outline=line,width=2)
+        yy=y+28
+        for item in limits:
+            d.ellipse((116,yy+9,130,yy+23),fill=cyan)
+            yy=draw_wrapped(d,item,(150,yy),fonts["small"],dark,1360,line_gap=6)+15
+        y+=385
+
+        d.text((82,y),"CONCLUSAO DA TRIAGEM",font=fonts["section"],fill=navy); y+=64
+        level_risk,_,_=self._risk_level_report(snapshot.get("max_ire",0))
+        conclusion=(
+            f"A triagem registrou nivel interno de exposicao {level_risk}, RULA maximo {rula}/7 e REBA maximo {reba}/15. "
+            "Os achados podem subsidiar a priorizacao de medidas preventivas e o aprofundamento da AEP/AET. "
+            "A decisao final deve considerar as variaveis nao capturadas automaticamente e a validacao da atividade em campo."
+        )
+        d.rounded_rectangle((82,y,1572,y+300),radius=22,fill=white,outline=cyan,width=3)
+        draw_wrapped(d,conclusion,(112,y+38),fonts["body_b"],dark,1410,line_gap=9)
+
+        d.line((82,2260,1572,2260),fill=line,width=2)
+        d.text((82,2280),"Instrumento de triagem e apoio a AEP/AET · nao substitui AET completa quando requerida.",font=fonts["tiny"],fill=gray)
+        return page
+
     def _pdf_ai_analysis_page(self, snapshot, analysis, page_number, total_pages):
         W, H = 1654, 2339
         page = Image.new("RGB", (W, H), (246, 249, 251))
@@ -2510,14 +2791,14 @@ class NR17Screen(BoxLayout):
             "small_b": load_report_font(26, True), "tiny": load_report_font(23, False),
         }
         d.rectangle((0,0,W,210), fill=navy); d.rectangle((0,200,W,210), fill=cyan)
-        d.text((82,48), "ANALISE ASSISTIDA DO POSTO", font=fonts["title"], fill=white)
-        d.text((86,132), f"Gemini multimodal | {self.ai_model_used or '-'}", font=fonts["small_b"], fill=(189,215,230))
+        d.text((82,48), "INTERPRETACAO ASSISTIDA DOS ACHADOS", font=fonts["title"], fill=white)
+        d.text((86,132), f"Interpretacao complementar baseada em dados e evidencias", font=fonts["small_b"], fill=(189,215,230))
         d.text((1370,96), f"{page_number}/{total_pages}", font=fonts["small_b"], fill=white)
 
         y = 270
         d.text((82,y), "LEITURA EXECUTIVA", font=fonts["section"], fill=navy); y += 70
         d.rounded_rectangle((82,y,1572,y+315), radius=24, fill=white, outline=line, width=3)
-        summary = analysis.get("resumo_executivo") or "A IA nao retornou um resumo executivo."
+        summary = analysis.get("resumo_executivo") or "A analise complementar nao retornou um resumo executivo."
         draw_wrapped(d, summary, (116,y+40), fonts["body"], dark, 1420, line_gap=10)
         y += 365
 
@@ -2535,7 +2816,7 @@ class NR17Screen(BoxLayout):
         factors = analysis.get("fatores") or []
         if not factors:
             d.rounded_rectangle((82,y,1572,y+220), radius=22, fill=white, outline=line, width=2)
-            d.text((112,y+55), "Nenhum achado especifico por fator foi retornado pela IA.", font=fonts["body"], fill=gray)
+            d.text((112,y+55), "Nenhum achado especifico por fator foi retornado pela analise complementar.", font=fonts["body"], fill=gray)
         else:
             card_gap = 22
             card_w = int((W - 164 - card_gap) / 2)
@@ -2557,7 +2838,7 @@ class NR17Screen(BoxLayout):
                     draw_wrapped(d, causes[0], (x+28,yy0+310), fonts["tiny"], gray, card_w-56, line_gap=4)
 
         d.line((82,2260,1572,2260), fill=line, width=2)
-        d.text((82,2280), "Analise visual assistida por IA; dados posturais permanecem os medidos pelo sistema.", font=fonts["tiny"], fill=gray)
+        d.text((82,2280), "Interpretacao assistida das evidencias; dados posturais permanecem os medidos pelo sistema.", font=fonts["tiny"], fill=gray)
         return page
 
     def _ai_action_fonts(self):
@@ -2595,7 +2876,7 @@ class NR17Screen(BoxLayout):
                 "prioridade": 1,
                 "acao": "Validar o posto com profissional de ergonomia e confrontar os achados visuais com a atividade real.",
                 "tipo": "Validacao", "fator": "GERAL",
-                "justificativa": "A IA nao retornou acoes especificas suficientes.",
+                "justificativa": "A analise complementar nao retornou acoes especificas suficientes.",
             }]
         plan = plan[:5]
         validation = list((analysis.get("alertas") or []) + (analysis.get("limitacoes") or []))[:5]
@@ -2680,7 +2961,7 @@ class NR17Screen(BoxLayout):
                 yy = draw_wrapped(d, txt, (148,yy), fonts["small"], dark, 1370, line_gap=6) + 12
 
         d.line((82,2260,1572,2260), fill=line, width=2)
-        d.text((82,2280), "Sugestoes assistidas por IA devem ser validadas no contexto da AEP/AET antes da implementacao.", font=fonts["tiny"], fill=gray)
+        d.text((82,2280), "Sugestoes automatizadas devem ser validadas no contexto da AEP/AET antes da implementacao.", font=fonts["tiny"], fill=gray)
         return page
 
     def _pdf_evidence_page(self, record, evidence_index, page_number, total_pages):
@@ -2820,22 +3101,27 @@ class NR17Screen(BoxLayout):
         try:
             snapshot = dict(snapshot or {})
             snapshot["evidencias"] = list(evidencias or [])
-            snapshot["analise_ia"] = ai_analysis
-            snapshot["modelo_ia"] = self.ai_model_used
+            snapshot["analise_assistida"] = ai_analysis
+            snapshot["motor_analise"] = self.ai_model_used
 
             action_specs = self._paginate_ai_action_plan(ai_analysis) if ai_analysis else []
-            ai_pages = (1 + len(action_specs)) if ai_analysis else 0
-            total_pages = 2 + ai_pages + len(evidencias)
+            assist_pages = (1 + len(action_specs)) if ai_analysis else 0
+            base_pages = 4  # resumo + detalhe + metodologia + qualidade/escopo
+            total_pages = base_pages + assist_pages + len(evidencias)
+
             pages = [
                 self._pdf_summary_page(snapshot),
                 self._pdf_posture_page(snapshot, total_pages),
+                self._pdf_methodology_page(snapshot, 3, total_pages),
+                self._pdf_quality_scope_page(snapshot, 4, total_pages),
             ]
-            if ai_analysis:
-                pages.append(self._pdf_ai_analysis_page(snapshot, ai_analysis, 3, total_pages))
-                for offset, spec in enumerate(action_specs, start=4):
-                    pages.append(self._pdf_ai_action_page(snapshot, ai_analysis, spec, offset, total_pages))
 
-            evidence_start = 3 + ai_pages
+            if ai_analysis:
+                pages.append(self._pdf_ai_analysis_page(snapshot, ai_analysis, 5, total_pages))
+                for page_no, spec in enumerate(action_specs, start=6):
+                    pages.append(self._pdf_ai_action_page(snapshot, ai_analysis, spec, page_no, total_pages))
+
+            evidence_start = base_pages + assist_pages + 1
             for idx, record in enumerate(evidencias, start=1):
                 pages.append(self._pdf_evidence_page(record, idx, evidence_start + idx - 1, total_pages))
 
@@ -2851,9 +3137,12 @@ class NR17Screen(BoxLayout):
             else:
                 base_msg = f"PDF gerado: {pdf_path.name}"
             if ai_failed:
-                base_msg += f" · sem IA: {self._ai_clip(self.ai_last_error or 'falha de rede/API', 150)}"
+                base_msg += f" · interpretacao complementar indisponivel: {self._ai_clip(self.ai_last_error or 'falha de rede/API', 120)}"
             elif ai_analysis:
-                base_msg += f" · analise IA concluida ({self.ai_model_used})."
+                fonte = str((ai_analysis or {}).get("fonte_analise") or "")
+                base_msg += " · interpretacao concluida"
+                if fonte == "somente_dados":
+                    base_msg += " somente com dados medidos"
             self.status_text = base_msg
         except Exception as exc:
             self.status_text = f"Erro ao gerar PDF: {exc}"
@@ -2864,7 +3153,7 @@ class NR17Screen(BoxLayout):
 
     def generate_report(self, *_):
         if self._ai_request_active:
-            self.status_text = "A analise IA do relatorio ja esta em andamento."
+            self.status_text = "A interpretacao complementar do relatorio ja esta em andamento."
             return
         try:
             evidencias = self._ordered_evidence_records()
@@ -2879,8 +3168,8 @@ class NR17Screen(BoxLayout):
             if not GEMINI_API_KEY or "SUA_CHAVE" in GEMINI_API_KEY:
                 self.ai_analysis = None
                 self.ai_model_used = None
-                self.ai_last_error = "GEMINI_API_KEY nao configurada no APK."
-                self.status_text = "Chave Gemini nao configurada. Gerando PDF tecnico sem IA..."
+                self.ai_last_error = "Servico de interpretacao nao configurado no APK."
+                self.status_text = "Servico de interpretacao nao configurado. Gerando PDF tecnico..."
                 Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
                 return
 
