@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.10
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.11
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -16,7 +16,7 @@ from datetime import datetime
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import Color, Line, Ellipse, RoundedRectangle
+from kivy.graphics import Color, Line, Ellipse, RoundedRectangle, Rectangle
 from kivy.metrics import dp
 from kivy.network.urlrequest import UrlRequest
 from kivy.properties import StringProperty
@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -319,6 +319,35 @@ def draw_wrapped(draw, text, xy, font, fill, max_width, line_gap=6):
         draw.text((x, y), item, font=font, fill=fill)
         y += line_h
     return y
+
+
+def measure_wrapped_height(draw, text, font, max_width, line_gap=6):
+    """Mede exatamente o mesmo bloco usado por draw_wrapped, sem desenhar."""
+    words = str(text or "").split()
+    if not words:
+        return 0
+    lines = []
+    line = ""
+    for word in words:
+        test = word if not line else f"{line} {word}"
+        try:
+            box = draw.textbbox((0, 0), test, font=font)
+            width = box[2] - box[0]
+        except Exception:
+            width = len(test) * 8
+        if line and width > max_width:
+            lines.append(line)
+            line = word
+        else:
+            line = test
+    if line:
+        lines.append(line)
+    try:
+        bbox = draw.textbbox((0, 0), "Ag", font=font)
+        line_h = max(18, bbox[3] - bbox[1] + line_gap)
+    except Exception:
+        line_h = 24
+    return len(lines) * line_h
 
 # ------------------------------------------------------------------
 # RULA / REBA
@@ -794,6 +823,12 @@ class NR17Screen(BoxLayout):
         self._frame_worker_busy = False
         self._running = False
 
+        # Modo câmera em tela cheia: reutiliza o MESMO preview/overlay,
+        # portanto a análise, as evidências automáticas e a calibração continuam ativas.
+        self._fullscreen_popup = None
+        self._preview_home_parent = None
+        self._preview_home_index = None
+
         self._build_ui()
         Clock.schedule_once(lambda dt: self._request_camera_permission(), 0.2)
 
@@ -1033,12 +1068,13 @@ class NR17Screen(BoxLayout):
         self.preview_area = FloatLayout()
         left.add_widget(self.preview_area)
 
-        controls = GridLayout(cols=6, size_hint_y=None, height=dp(52), spacing=dp(5))
+        controls = GridLayout(cols=7, size_hint_y=None, height=dp(52), spacing=dp(5))
         controls.add_widget(self._button("INICIAR", self.start_camera, primary=True))
         controls.add_widget(self._button("PARAR", self.stop_camera))
         controls.add_widget(self._button("CICLO", self.toggle_cycle))
         self.report_btn = self._button("RELATÓRIO + IA", self.generate_report, primary=True)
         controls.add_widget(self.report_btn)
+        controls.add_widget(self._button("TELA CHEIA", self.open_fullscreen_camera))
         controls.add_widget(self._button("⚙ CÂMERA", self.open_calibration))
         controls.add_widget(self._button("ZERAR", self.reset_measurement))
         left.add_widget(controls)
@@ -1078,6 +1114,98 @@ class NR17Screen(BoxLayout):
         right.add_widget(grid)
         main.add_widget(right)
         self.add_widget(main)
+
+    # --------------------------- Câmera em tela cheia ---------------------------
+    def open_fullscreen_camera(self, *_):
+        if self._fullscreen_popup is not None:
+            return
+        if not self.preview_area or self.preview_area.parent is None:
+            self.status_text = "Preview da câmera ainda não está disponível."
+            return
+
+        # Guarda exatamente onde o preview estava para recolocá-lo sem reconstruir a câmera.
+        self._preview_home_parent = self.preview_area.parent
+        try:
+            self._preview_home_index = self._preview_home_parent.children.index(self.preview_area)
+        except Exception:
+            self._preview_home_index = 0
+        self._preview_home_parent.remove_widget(self.preview_area)
+
+        full = FloatLayout()
+        with full.canvas.before:
+            Color(0.0, 0.0, 0.0, 1.0)
+            self._fullscreen_bg = Rectangle(pos=full.pos, size=full.size)
+        full.bind(
+            pos=lambda w, v: setattr(self._fullscreen_bg, "pos", w.pos),
+            size=lambda w, v: setattr(self._fullscreen_bg, "size", w.size),
+        )
+
+        self.preview_area.size_hint = (1, 1)
+        self.preview_area.pos_hint = {"x": 0, "y": 0}
+        full.add_widget(self.preview_area)
+
+        # Controles flutuantes ficam FORA do preview_area, portanto não aparecem nas evidências.
+        exit_btn = Button(
+            text="SAIR DA TELA CHEIA",
+            size_hint=(None, None), size=(dp(190), dp(52)),
+            pos_hint={"right": 0.985, "top": 0.985},
+            background_normal="", background_color=(0.02, 0.12, 0.20, 0.88),
+            color=TEXT, bold=True, font_size="13sp",
+        )
+        exit_btn.bind(on_release=self.close_fullscreen_camera)
+        full.add_widget(exit_btn)
+
+        info = Label(
+            text="NR-17 · análise e evidências continuam ativas",
+            size_hint=(None, None), size=(dp(360), dp(42)),
+            pos_hint={"x": 0.015, "top": 0.985},
+            color=(0.94, 0.98, 1, 0.92), bold=True, font_size="12sp",
+            halign="left", valign="middle",
+        )
+        info.bind(size=lambda w, v: setattr(w, "text_size", w.size))
+        full.add_widget(info)
+
+        popup = Popup(
+            title="", title_size="0sp", separator_height=0,
+            content=full, size_hint=(1, 1), auto_dismiss=False,
+            background_color=(0, 0, 0, 1),
+        )
+        popup.bind(on_dismiss=self._restore_preview_after_fullscreen)
+        self._fullscreen_popup = popup
+        popup.open()
+        self.status_text = "Câmera em tela cheia · análise postural continua ativa."
+        Clock.schedule_once(lambda dt: self._fit_preview(), 0.05)
+        Clock.schedule_once(lambda dt: self._fit_preview(), 0.25)
+
+    def close_fullscreen_camera(self, *_):
+        popup = self._fullscreen_popup
+        if popup is not None:
+            popup.dismiss()
+
+    def _restore_preview_after_fullscreen(self, *_):
+        parent = self._preview_home_parent
+        if self.preview_area is not None:
+            try:
+                if self.preview_area.parent is not None:
+                    self.preview_area.parent.remove_widget(self.preview_area)
+            except Exception:
+                pass
+            if parent is not None:
+                try:
+                    idx = int(self._preview_home_index or 0)
+                    idx = max(0, min(idx, len(parent.children)))
+                    parent.add_widget(self.preview_area, index=idx)
+                except Exception:
+                    try:
+                        parent.add_widget(self.preview_area)
+                    except Exception:
+                        pass
+        self._fullscreen_popup = None
+        self._preview_home_parent = None
+        self._preview_home_index = None
+        self.status_text = "Câmera voltou ao modo painel."
+        Clock.schedule_once(lambda dt: self._fit_preview(), 0.05)
+        Clock.schedule_once(lambda dt: self._fit_preview(), 0.25)
 
     # --------------------------- Android / ML Kit ---------------------------
     def _request_camera_permission(self):
@@ -2432,50 +2560,124 @@ class NR17Screen(BoxLayout):
         d.text((82,2280), "Analise visual assistida por IA; dados posturais permanecem os medidos pelo sistema.", font=fonts["tiny"], fill=gray)
         return page
 
-    def _pdf_ai_action_page(self, snapshot, analysis, page_number, total_pages):
-        W, H = 1654, 2339
-        page = Image.new("RGB", (W, H), (246, 249, 251)); d = ImageDraw.Draw(page)
-        navy=(10,38,64); navy2=(18,62,96); cyan=(35,158,183); dark=(31,45,58); gray=(96,113,128); line=(215,225,233); white=(255,255,255)
-        fonts = {
+    def _ai_action_fonts(self):
+        return {
             "title": load_report_font(62, True), "section": load_report_font(42, True),
             "body": load_report_font(31, False), "body_b": load_report_font(31, True),
             "label": load_report_font(25, True), "small": load_report_font(25, False),
             "small_b": load_report_font(25, True), "tiny": load_report_font(23, False),
             "prio": load_report_font(48, True),
         }
+
+    def _ai_action_card_height(self, draw, item, fonts):
+        text_w = 1260
+        action = str(item.get("acao") or "Acao nao informada")
+        meta = f"TIPO: {str(item.get('tipo') or 'Melhoria').upper()}   |   FATOR: {str(item.get('fator') or 'GERAL').upper()}"
+        justification = str(item.get("justificativa") or "")
+        ah = measure_wrapped_height(draw, action, fonts["body_b"], text_w, line_gap=7)
+        mh = measure_wrapped_height(draw, meta, fonts["label"], text_w, line_gap=5)
+        jh = measure_wrapped_height(draw, justification, fonts["small"], text_w, line_gap=7)
+        # Folgas explícitas entre ação, tipo/fator e justificativa.
+        return max(270, 34 + ah + 22 + mh + 22 + jh + 38)
+
+    def _ai_validation_height(self, draw, texts, fonts):
+        if not texts:
+            return 0
+        total = 86
+        for txt in texts[:5]:
+            total += max(34, measure_wrapped_height(draw, txt, fonts["small"], 1370, line_gap=6)) + 14
+        return max(220, total + 30)
+
+    def _paginate_ai_action_plan(self, analysis):
+        plan = list(analysis.get("plano_acao") or [])
+        if not plan:
+            plan = [{
+                "prioridade": 1,
+                "acao": "Validar o posto com profissional de ergonomia e confrontar os achados visuais com a atividade real.",
+                "tipo": "Validacao", "fator": "GERAL",
+                "justificativa": "A IA nao retornou acoes especificas suficientes.",
+            }]
+        plan = plan[:5]
+        validation = list((analysis.get("alertas") or []) + (analysis.get("limitacoes") or []))[:5]
+
+        dummy = Image.new("RGB", (1654, 2339), "white")
+        draw = ImageDraw.Draw(dummy)
+        fonts = self._ai_action_fonts()
+        y_start = 340
+        content_bottom = 2185
+        gap = 24
+        groups = []
+        current = []
+        y = y_start
+        for item in plan:
+            h = self._ai_action_card_height(draw, item, fonts)
+            if current and y + h > content_bottom:
+                groups.append({"items": current, "validation": []})
+                current = []
+                y = y_start
+            current.append(item)
+            y += h + gap
+        if current:
+            groups.append({"items": current, "validation": []})
+        if not groups:
+            groups = [{"items": [], "validation": []}]
+
+        if validation:
+            last = groups[-1]
+            y = y_start
+            for item in last["items"]:
+                y += self._ai_action_card_height(draw, item, fonts) + gap
+            vh = self._ai_validation_height(draw, validation, fonts)
+            if y + 20 + vh <= content_bottom:
+                last["validation"] = validation
+            else:
+                groups.append({"items": [], "validation": validation})
+        return groups
+
+    def _pdf_ai_action_page(self, snapshot, analysis, page_spec, page_number, total_pages):
+        W, H = 1654, 2339
+        page = Image.new("RGB", (W, H), (246, 249, 251)); d = ImageDraw.Draw(page)
+        navy=(10,38,64); navy2=(18,62,96); cyan=(35,158,183); dark=(31,45,58); gray=(96,113,128); line=(215,225,233); white=(255,255,255)
+        fonts = self._ai_action_fonts()
         d.rectangle((0,0,W,210), fill=navy); d.rectangle((0,200,W,210), fill=cyan)
         d.text((82,48), "PLANO DE ACAO SUGERIDO", font=fonts["title"], fill=white)
-        d.text((86,132), "Prioridade para controles na fonte e melhorias de engenharia", font=fonts["small_b"], fill=(189,215,230))
+        subtitle = "Prioridade para controles na fonte e melhorias de engenharia"
+        if not page_spec.get("items") and page_spec.get("validation"):
+            subtitle = "Validacoes, limitacoes e pontos que exigem confirmacao em campo"
+        d.text((86,132), subtitle, font=fonts["small_b"], fill=(189,215,230))
         d.text((1370,96), f"{page_number}/{total_pages}", font=fonts["small_b"], fill=white)
 
         y=270
-        d.text((82,y), "ACOES PRIORITARIAS", font=fonts["section"], fill=navy); y+=70
-        plan = analysis.get("plano_acao") or []
-        if not plan:
-            plan = [{"prioridade":1,"acao":"Validar o posto com profissional de ergonomia e confrontar os achados visuais com a atividade real.","tipo":"Validacao","fator":"GERAL","justificativa":"A IA nao retornou acoes especificas suficientes."}]
-        card_h=295
-        for idx,item in enumerate(plan[:5], start=1):
-            if y+card_h > 2060:
-                break
-            d.rounded_rectangle((82,y,1572,y+card_h), radius=24, fill=white, outline=line, width=3)
-            d.rounded_rectangle((108,y+28,220,y+140), radius=20, fill=cyan if idx<=2 else navy2)
-            d.text((142,y+52), str(item.get("prioridade", idx)), font=fonts["prio"], fill=white)
-            x=255
-            draw_wrapped(d, str(item.get("acao") or "Acao nao informada"), (x,y+28), fonts["body_b"], dark, 1260, line_gap=7)
-            d.text((x,y+105), f"TIPO: {str(item.get('tipo') or 'Melhoria').upper()}   |   FATOR: {str(item.get('fator') or 'GERAL').upper()}", font=fonts["label"], fill=navy2)
-            draw_wrapped(d, str(item.get("justificativa") or ""), (x,y+155), fonts["small"], gray, 1260, line_gap=7)
-            y += card_h + 24
+        items = list(page_spec.get("items") or [])
+        validation = list(page_spec.get("validation") or [])
+        if items:
+            d.text((82,y), "ACOES PRIORITARIAS", font=fonts["section"], fill=navy); y+=70
+            for idx,item in enumerate(items, start=1):
+                card_h = self._ai_action_card_height(d, item, fonts)
+                d.rounded_rectangle((82,y,1572,y+card_h), radius=24, fill=white, outline=line, width=3)
+                prio = int(item.get("prioridade", idx) or idx)
+                d.rounded_rectangle((108,y+28,220,y+140), radius=20, fill=cyan if prio<=2 else navy2)
+                d.text((142,y+52), str(prio), font=fonts["prio"], fill=white)
 
-        alerts = analysis.get("alertas") or []
-        limits = analysis.get("limitacoes") or []
-        if y < 2110:
-            y += 18
-            d.rounded_rectangle((82,y,1572,min(2220,y+310)), radius=22, fill=(238,245,248), outline=line, width=2)
-            d.text((112,y+24), "VALIDACOES NECESSARIAS", font=fonts["section"], fill=navy)
-            yy=y+86
-            for txt in (alerts + limits)[:4]:
+                x=255
+                yy = draw_wrapped(d, str(item.get("acao") or "Acao nao informada"), (x,y+30), fonts["body_b"], dark, 1260, line_gap=7)
+                yy += 18
+                meta = f"TIPO: {str(item.get('tipo') or 'Melhoria').upper()}   |   FATOR: {str(item.get('fator') or 'GERAL').upper()}"
+                yy = draw_wrapped(d, meta, (x,yy), fonts["label"], navy2, 1260, line_gap=5)
+                yy += 18
+                draw_wrapped(d, str(item.get("justificativa") or ""), (x,yy), fonts["small"], gray, 1260, line_gap=7)
+                y += card_h + 24
+
+        if validation:
+            if items:
+                y += 8
+            d.text((82,y), "VALIDACOES NECESSARIAS", font=fonts["section"], fill=navy); y += 64
+            vh = self._ai_validation_height(d, validation, fonts)
+            d.rounded_rectangle((82,y,1572,min(2210,y+vh)), radius=22, fill=(238,245,248), outline=line, width=2)
+            yy=y+28
+            for txt in validation:
                 d.ellipse((116,yy+8,130,yy+22), fill=cyan)
-                yy = draw_wrapped(d, txt, (148,yy), fonts["small"], dark, 1370, line_gap=6) + 9
+                yy = draw_wrapped(d, txt, (148,yy), fonts["small"], dark, 1370, line_gap=6) + 12
 
         d.line((82,2260,1572,2260), fill=line, width=2)
         d.text((82,2280), "Sugestoes assistidas por IA devem ser validadas no contexto da AEP/AET antes da implementacao.", font=fonts["tiny"], fill=gray)
@@ -2621,7 +2823,8 @@ class NR17Screen(BoxLayout):
             snapshot["analise_ia"] = ai_analysis
             snapshot["modelo_ia"] = self.ai_model_used
 
-            ai_pages = 2 if ai_analysis else 0
+            action_specs = self._paginate_ai_action_plan(ai_analysis) if ai_analysis else []
+            ai_pages = (1 + len(action_specs)) if ai_analysis else 0
             total_pages = 2 + ai_pages + len(evidencias)
             pages = [
                 self._pdf_summary_page(snapshot),
@@ -2629,7 +2832,8 @@ class NR17Screen(BoxLayout):
             ]
             if ai_analysis:
                 pages.append(self._pdf_ai_analysis_page(snapshot, ai_analysis, 3, total_pages))
-                pages.append(self._pdf_ai_action_page(snapshot, ai_analysis, 4, total_pages))
+                for offset, spec in enumerate(action_specs, start=4):
+                    pages.append(self._pdf_ai_action_page(snapshot, ai_analysis, spec, offset, total_pages))
 
             evidence_start = 3 + ai_pages
             for idx, record in enumerate(evidencias, start=1):
@@ -2720,6 +2924,11 @@ class NR17Screen(BoxLayout):
             self.overlay.clear_pose()
 
     def shutdown(self):
+        try:
+            if self._fullscreen_popup is not None:
+                self._fullscreen_popup.dismiss()
+        except Exception:
+            pass
         self.stop_camera()
         try:
             if self.pose_analyzer:
