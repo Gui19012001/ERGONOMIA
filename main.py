@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.9
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.10
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.1.10"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -149,13 +149,16 @@ FACTOR_LABELS = {
 # Os modelos abaixo possuem nivel gratuito na Gemini Developer API.
 # ------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+# Free tier: Flash-Lite primeiro (mais leve/rápido); Flash como fallback de qualidade.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 GEMINI_MODELS = tuple(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
-GEMINI_RETRY_DELAYS = (2.0, 5.0)
-GEMINI_TIMEOUT = max(30, env_int("GEMINI_TIMEOUT", 75))
-GEMINI_IMAGE_LONG_SIDE = max(640, min(1600, env_int("GEMINI_IMAGE_LONG_SIDE", 1024)))
-GEMINI_IMAGE_QUALITY = max(60, min(92, env_int("GEMINI_IMAGE_QUALITY", 82)))
+# 429 normalmente é quota/rate limit, não simples indisponibilidade momentânea.
+GEMINI_RETRY_DELAYS = (8.0, 20.0)
+GEMINI_TIMEOUT = max(30, env_int("GEMINI_TIMEOUT", 90))
+GEMINI_IMAGE_LONG_SIDE = max(640, min(1280, env_int("GEMINI_IMAGE_LONG_SIDE", 768)))
+GEMINI_IMAGE_QUALITY = max(55, min(90, env_int("GEMINI_IMAGE_QUALITY", 72)))
+GEMINI_MAX_IMAGES = max(1, min(4, env_int("GEMINI_MAX_IMAGES", 4)))
 
 
 # ------------------------------------------------------------------
@@ -1876,14 +1879,14 @@ class NR17Screen(BoxLayout):
                 buf = io.BytesIO()
                 im.save(buf, format="JPEG", quality=GEMINI_IMAGE_QUALITY, optimize=True)
                 encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-            return {"inline_data": {"mime_type": "image/jpeg", "data": encoded}}
+            return {"inlineData": {"mimeType": "image/jpeg", "data": encoded}}
         except Exception:
             return None
 
     def _build_gemini_payload(self, snapshot, evidencias):
         parts = [{"text": self._build_ai_prompt(snapshot, evidencias)}]
         image_count = 0
-        for rec in evidencias[:4]:
+        for rec in evidencias[:GEMINI_MAX_IMAGES]:
             image_part = self._prepare_gemini_image_part(rec)
             if not image_part:
                 continue
@@ -1906,7 +1909,7 @@ class NR17Screen(BoxLayout):
                 buf = io.BytesIO()
                 ctx.save(buf, format="JPEG", quality=GEMINI_IMAGE_QUALITY, optimize=True)
                 parts.append({"text": "IMAGEM DE CONTEXTO DO POSTO: nenhuma evidencia critica automatica foi registrada."})
-                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}})
+                parts.append({"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}})
             except Exception:
                 pass
 
@@ -1914,7 +1917,7 @@ class NR17Screen(BoxLayout):
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "temperature": 0.25,
-                "maxOutputTokens": 2600,
+                "maxOutputTokens": 1800,
                 "responseMimeType": "application/json",
             },
         }
@@ -1940,6 +1943,60 @@ class NR17Screen(BoxLayout):
             return path
         except Exception:
             return None
+
+    def _gemini_error_info(self, res, status=0):
+        """Extrai status/mensagem reais da Gemini sem expor a chave."""
+        code = int(status or 0)
+        api_status = ""
+        message = ""
+        try:
+            err = (res or {}).get("error", {}) if isinstance(res, dict) else {}
+            if isinstance(err, dict):
+                code = int(err.get("code") or code or 0)
+                api_status = str(err.get("status") or "").strip()
+                message = str(err.get("message") or "").strip()
+        except Exception:
+            pass
+        if not message:
+            try:
+                message = str(res or "")[:500]
+            except Exception:
+                message = ""
+        return code, api_status, self._ai_clip(message, 500)
+
+    def _save_ai_error(self, model, status, api_status, detail, payload, evidencias):
+        """Salva diagnóstico local para sabermos exatamente por que a API recusou."""
+        try:
+            info = {
+                "gerado_em": datetime.now().isoformat(timespec="seconds"),
+                "modelo": model,
+                "http_status": int(status or 0),
+                "api_status": str(api_status or ""),
+                "mensagem": str(detail or ""),
+                "payload_bytes": len(payload or b""),
+                "imagens": min(len(evidencias or []), GEMINI_MAX_IMAGES),
+            }
+            path = self._assessment_dir() / "erro_ia.json"
+            path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+            return path
+        except Exception:
+            return None
+
+    def _friendly_ai_error(self, status, api_status, detail):
+        status = int(status or 0)
+        api_status = str(api_status or "").upper()
+        detail = str(detail or "").strip()
+        if status == 429 or api_status == "RESOURCE_EXHAUSTED":
+            return "Limite gratuito/quota da Gemini atingido (HTTP 429)."
+        if status == 400 or api_status == "INVALID_ARGUMENT":
+            return "Requisicao da Gemini recusada por formato/dados (HTTP 400)."
+        if status == 403 or api_status == "PERMISSION_DENIED":
+            return "Chave/projeto Gemini sem permissao (HTTP 403)."
+        if status == 404 or api_status == "NOT_FOUND":
+            return "Modelo Gemini indisponivel para esta chave (HTTP 404)."
+        if status in (500, 502, 503, 504):
+            return f"Servico Gemini temporariamente indisponivel (HTTP {status})."
+        return f"Falha Gemini HTTP {status or 0}." + (f" {detail[:120]}" if detail else "")
 
     def _request_ai_for_report(self, snapshot, evidencias, model_index=0, retry_index=0, payload=None):
         if payload is None:
@@ -1969,34 +2026,49 @@ class NR17Screen(BoxLayout):
         def fail(req, res):
             if token != self._ai_request_token:
                 return
-            status = int(getattr(req, "resp_status", 0) or 0)
-            detail = ""
-            try:
-                detail = str((res or {}).get("error", {}).get("message") or "")
-            except Exception:
-                detail = str(res or "")[:180]
+            raw_status = int(getattr(req, "resp_status", 0) or 0)
+            status, api_status, detail = self._gemini_error_info(res, raw_status)
+            self._save_ai_error(model, status, api_status, detail, payload, evidencias)
+
+            # 429: tenta o outro modelo do free tier imediatamente antes de esperar.
+            if (status == 429 or api_status.upper() == "RESOURCE_EXHAUSTED") and model_index + 1 < len(GEMINI_MODELS) and retry_index == 0:
+                self.status_text = f"Limite/quota no {model} · tentando {GEMINI_MODELS[model_index + 1]}..."
+                Clock.schedule_once(
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
+                )
+                return
+
+            # Erros temporários: espera de verdade antes de repetir.
             if status in (429, 500, 502, 503, 504) and retry_index < len(GEMINI_RETRY_DELAYS):
                 delay = GEMINI_RETRY_DELAYS[retry_index]
-                self.status_text = f"IA ocupada · nova tentativa em {int(delay)}s..."
+                label = "limite/quota" if status == 429 else "servico temporariamente indisponivel"
+                self.status_text = f"Gemini: {label} · nova tentativa em {int(delay)}s..."
                 Clock.schedule_once(
                     lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload),
                     delay,
                 )
                 return
-            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 429, 500, 502, 503, 504):
-                self.status_text = "Usando modelo IA alternativo..."
+
+            # Modelo inexistente: troca de modelo; 400/403 não adianta repetir cegamente.
+            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 500, 502, 503, 504):
+                self.status_text = f"Tentando modelo alternativo: {GEMINI_MODELS[model_index + 1]}..."
                 Clock.schedule_once(
                     lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
                 )
                 return
-            self._handle_ai_final_error(snapshot, evidencias, f"HTTP {status}: {detail}".strip())
+
+            friendly = self._friendly_ai_error(status, api_status, detail)
+            self._handle_ai_final_error(
+                snapshot, evidencias,
+                f"{friendly} API={api_status or '-'} | {detail}".strip(),
+            )
 
         def net(req, err):
             if token != self._ai_request_token:
                 return
             if retry_index < len(GEMINI_RETRY_DELAYS):
                 delay = GEMINI_RETRY_DELAYS[retry_index]
-                self.status_text = f"Sem resposta da IA · tentando novamente em {int(delay)}s..."
+                self.status_text = f"Sem resposta da Gemini · tentando novamente em {int(delay)}s..."
                 Clock.schedule_once(
                     lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload),
                     delay,
@@ -2024,7 +2096,7 @@ class NR17Screen(BoxLayout):
         self.ai_analysis = None
         self.ai_model_used = None
         self._ai_request_active = False
-        self.status_text = "IA indisponivel. Gerando o PDF tecnico sem a pagina de IA..."
+        self.status_text = f"IA falhou: {self.ai_last_error} · gerando PDF tecnico..."
         Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
 
     # --------------------------- PDF ---------------------------
@@ -2575,7 +2647,7 @@ class NR17Screen(BoxLayout):
             else:
                 base_msg = f"PDF gerado: {pdf_path.name}"
             if ai_failed:
-                base_msg += " · sem analise IA (falha de rede/API)."
+                base_msg += f" · sem IA: {self._ai_clip(self.ai_last_error or 'falha de rede/API', 150)}"
             elif ai_analysis:
                 base_msg += f" · analise IA concluida ({self.ai_model_used})."
             self.status_text = base_msg
