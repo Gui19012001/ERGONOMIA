@@ -85,7 +85,7 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.12 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.13 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
@@ -117,6 +117,11 @@ jobs:
           LANDMARK_CONFIRM_FRAMES=2
           LANDMARK_JUMP_LIMIT=0.18
           LANDMARK_SMOOTH_ALPHA=0.65
+
+          # Rastreamento corporal por toque
+          BODY_TARGET_MAX_DISTANCE=0.32
+          BODY_TARGET_TRACK_ALPHA=0.22
+          BODY_TARGET_MIN_BODY_PCT=75
 
           # Evidencia automatica: guarda somente a mais critica por fator
           AUTO_EVIDENCE_HOLD_S=0.80
