@@ -1,11 +1,13 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.8
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.9
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
 import os
 import json
 import math
+import base64
+import io
 import time
 import threading
 from pathlib import Path
@@ -16,6 +18,7 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.graphics import Color, Line, Ellipse, RoundedRectangle
 from kivy.metrics import dp
+from kivy.network.urlrequest import UrlRequest
 from kivy.properties import StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -32,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -139,6 +142,21 @@ FACTOR_LABELS = {
     "arm": "BRACO",
     "knee": "JOELHO",
 }
+
+# ------------------------------------------------------------------
+# GEMINI - ANALISE MULTIMODAL DO POSTO
+# A chave e injetada pelo GitHub Actions via teste.env.
+# Os modelos abaixo possuem nivel gratuito na Gemini Developer API.
+# ------------------------------------------------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+GEMINI_MODELS = tuple(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
+GEMINI_RETRY_DELAYS = (2.0, 5.0)
+GEMINI_TIMEOUT = max(30, env_int("GEMINI_TIMEOUT", 75))
+GEMINI_IMAGE_LONG_SIDE = max(640, min(1600, env_int("GEMINI_IMAGE_LONG_SIDE", 1024)))
+GEMINI_IMAGE_QUALITY = max(60, min(92, env_int("GEMINI_IMAGE_QUALITY", 82)))
+
 
 # ------------------------------------------------------------------
 # HELPERS
@@ -754,6 +772,14 @@ class NR17Screen(BoxLayout):
         self.evidence_records = []
         self.last_exported_report = None
 
+        # Analise multimodal Gemini. A IA nao recalcula RULA/REBA/IRE;
+        # ela interpreta o ambiente e sugere acoes usando os dados medidos.
+        self.ai_analysis = None
+        self.ai_model_used = None
+        self.ai_last_error = None
+        self._ai_request_active = False
+        self._ai_request_token = 0
+
         # Evidências automáticas críticas: no máximo 1 por fator.
         self._factor_high_since = {name: None for name in FACTOR_ORDER}
         self._factor_best_severity = {}
@@ -983,7 +1009,7 @@ class NR17Screen(BoxLayout):
         header = Card(size_hint_y=None, height=dp(62), padding=dp(10), spacing=dp(10))
         title_box = BoxLayout(orientation="vertical")
         title_box.add_widget(self._label("NR-17 | ERGONOMIA POR VISÃO", CYAN, "20sp", True))
-        title_box.add_widget(self._label(f"ML Kit local · calibração ao vivo · evidências · PDF · v{APP_VERSION}", MUTED, "11sp"))
+        title_box.add_widget(self._label(f"ML Kit local · evidências críticas · Gemini multimodal · PDF · v{APP_VERSION}", MUTED, "11sp"))
         self.status_lbl = self._label(self.status_text, YELLOW, "11sp", True)
         self.bind(status_text=lambda *_: setattr(self.status_lbl, "text", self.status_text))
         header.add_widget(title_box)
@@ -1008,7 +1034,8 @@ class NR17Screen(BoxLayout):
         controls.add_widget(self._button("INICIAR", self.start_camera, primary=True))
         controls.add_widget(self._button("PARAR", self.stop_camera))
         controls.add_widget(self._button("CICLO", self.toggle_cycle))
-        controls.add_widget(self._button("RELATÓRIO", self.generate_report, primary=True))
+        self.report_btn = self._button("RELATÓRIO + IA", self.generate_report, primary=True)
+        controls.add_widget(self.report_btn)
         controls.add_widget(self._button("⚙ CÂMERA", self.open_calibration))
         controls.add_widget(self._button("ZERAR", self.reset_measurement))
         left.add_widget(controls)
@@ -1444,6 +1471,8 @@ class NR17Screen(BoxLayout):
             "pico_em": self.peak_at,
             "evidencias": list(self._ordered_evidence_records()),
             "modo_evidencia": "automatica_mais_critica_por_fator",
+            "analise_ia": self.ai_analysis,
+            "modelo_ia": self.ai_model_used,
             "config": {
                 "camera_preview_rotation": self.camera_preview_rotation,
                 "pose_rotation": self.pose_rotation,
@@ -1669,6 +1698,8 @@ class NR17Screen(BoxLayout):
                 "camera_preview_rotation": int(self.camera_preview_rotation),
                 "pose_rotation": int(self.pose_rotation),
                 "mirror_x": bool(self.mirror_x), "mirror_y": bool(self.mirror_y),
+                "preview_width": int(base_img.width),
+                "preview_height": int(base_img.height),
             }
 
             replaced = False
@@ -1687,6 +1718,314 @@ class NR17Screen(BoxLayout):
         self._save_assessment_json()
         nomes = ", ".join(c["label"] for c in candidates)
         self.status_text = f"Evidencia critica atualizada automaticamente: {nomes}."
+
+    # --------------------------- Gemini multimodal ---------------------------
+    def _gemini_url(self, model):
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+    def _ai_clip(self, value, limit=700):
+        text = str(value or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:max(0, limit - 3)].rstrip() + "..."
+
+    def _ai_list(self, value, max_items=5, item_limit=260):
+        if not isinstance(value, list):
+            return []
+        out = []
+        for item in value[:max_items]:
+            txt = self._ai_clip(item, item_limit)
+            if txt:
+                out.append(txt)
+        return out
+
+    def _normalise_ai_analysis(self, data):
+        """Limita e normaliza a resposta para o PDF nunca estourar visualmente."""
+        if not isinstance(data, dict):
+            raise ValueError("Resposta da IA nao e um objeto JSON.")
+
+        factors = []
+        raw_factors = data.get("fatores") or []
+        if isinstance(raw_factors, dict):
+            raw_factors = [dict(v or {}, fator=k) for k, v in raw_factors.items()]
+        for item in raw_factors[:4]:
+            if not isinstance(item, dict):
+                continue
+            factors.append({
+                "fator": self._ai_clip(item.get("fator") or "GERAL", 40).upper(),
+                "criticidade": self._ai_clip(item.get("criticidade") or "", 30).upper(),
+                "observacao": self._ai_clip(item.get("observacao") or item.get("evidencia") or "", 420),
+                "causas_visuais": self._ai_list(item.get("causas_visuais") or item.get("causas") or [], 3, 210),
+                "acoes": self._ai_list(item.get("acoes") or [], 3, 240),
+            })
+
+        plan = []
+        for i, item in enumerate(data.get("plano_acao") or [], start=1):
+            if not isinstance(item, dict) or len(plan) >= 5:
+                continue
+            try:
+                priority = int(item.get("prioridade", i))
+            except Exception:
+                priority = i
+            plan.append({
+                "prioridade": priority,
+                "acao": self._ai_clip(item.get("acao") or "", 360),
+                "tipo": self._ai_clip(item.get("tipo") or "Melhoria", 50),
+                "fator": self._ai_clip(item.get("fator") or "Geral", 50).upper(),
+                "justificativa": self._ai_clip(item.get("justificativa") or item.get("motivo") or "", 360),
+            })
+        plan.sort(key=lambda x: x.get("prioridade", 99))
+
+        return {
+            "status": "ok",
+            "gerado_em": datetime.now().isoformat(timespec="seconds"),
+            "resumo_executivo": self._ai_clip(data.get("resumo_executivo") or data.get("resumo") or "", 900),
+            "ambiente_observado": self._ai_list(data.get("ambiente_observado") or data.get("ambiente") or [], 5, 260),
+            "fatores": factors,
+            "plano_acao": plan,
+            "alertas": self._ai_list(data.get("alertas") or [], 4, 260),
+            "limitacoes": self._ai_list(data.get("limitacoes") or [], 3, 260),
+        }
+
+    def _build_ai_prompt(self, snapshot, evidencias):
+        measured = {
+            "setor": snapshot.get("setor") or "nao informado",
+            "posto": snapshot.get("posto") or "nao informado",
+            "colaborador": snapshot.get("colaborador") or "nao informado",
+            "tempo_valido_s": snapshot.get("tempo_valido_s", 0),
+            "ire_max": snapshot.get("max_ire", 0),
+            "rula_max": snapshot.get("max_rula", 0),
+            "reba_max": snapshot.get("max_reba", 0),
+            "exposicao_total_pct": snapshot.get("exposicao_total_pct", 0),
+            "exposicao_tronco_pct": snapshot.get("exposicao_tronco_pct", 0),
+            "exposicao_pescoco_pct": snapshot.get("exposicao_pescoco_pct", 0),
+            "exposicao_braco_pct": snapshot.get("exposicao_braco_pct", 0),
+            "exposicao_joelho_pct": snapshot.get("exposicao_joelho_pct", 0),
+            "limites": {
+                "tronco_graus": TRUNK_LIMIT,
+                "pescoco_graus": NECK_LIMIT,
+                "braco_graus": ARM_LIMIT,
+                "joelho_graus": KNEE_LIMIT,
+            },
+            "pico": snapshot.get("pico") or {},
+            "evidencias": [
+                {
+                    "fator": r.get("factor_label") or r.get("factor"),
+                    "lado": r.get("factor_side"),
+                    "valor": r.get("factor_value"),
+                    "limite": r.get("factor_limit"),
+                    "severidade": r.get("factor_severity"),
+                    "ire": r.get("ire"), "rula": r.get("rula"), "reba": r.get("reba"),
+                    "qualidade_pct": r.get("quality"), "cobertura_pct": r.get("coverage"),
+                }
+                for r in evidencias
+            ],
+        }
+        schema = {
+            "resumo_executivo": "texto curto e objetivo",
+            "ambiente_observado": ["elemento visivel do ambiente/posto"],
+            "fatores": [{
+                "fator": "TRONCO|PESCOCO|BRACO|JOELHO|GERAL",
+                "criticidade": "BAIXA|MODERADA|ALTA|CRITICA",
+                "observacao": "o que os dados e a imagem sustentam",
+                "causas_visuais": ["possivel causa visivel, sem inventar"],
+                "acoes": ["acao pratica priorizando engenharia/fonte"],
+            }],
+            "plano_acao": [{
+                "prioridade": 1,
+                "acao": "acao objetiva",
+                "tipo": "Engenharia|Layout|Dispositivo|Organizacao|Treinamento|Validacao",
+                "fator": "fator relacionado",
+                "justificativa": "por que esta acao e prioritaria",
+            }],
+            "alertas": ["ponto que merece validacao humana"],
+            "limitacoes": ["o que nao pode ser concluido apenas pelas imagens/dados"],
+        }
+        return (
+            "Voce atua como assistente tecnico de ergonomia industrial para apoiar uma AEP/AET. "
+            "Analise as imagens do posto e os DADOS MEDIDOS abaixo.\n\n"
+            "REGRAS OBRIGATORIAS:\n"
+            "1. IRE, RULA, REBA e angulos sao dados medidos pelo sistema. NAO recalcule, NAO corrija e NAO substitua esses valores.\n"
+            "2. Use as imagens para analisar SOMENTE elementos realmente visiveis do ambiente, alcance, altura aparente, posicionamento, apoio, layout e relacao operador-posto.\n"
+            "3. Nao invente peso, forca, frequencia, repetitividade, duracao de ciclo, dimensoes ou condicoes que nao estejam nos dados. Quando algo nao puder ser confirmado, diga que precisa de validacao.\n"
+            "4. Proponha acoes na hierarquia: eliminar/reduzir na fonte e engenharia primeiro; layout/dispositivo depois; organizacao depois; treinamento/comportamento por ultimo.\n"
+            "5. As acoes devem ser praticas para ambiente industrial e diretamente relacionadas aos achados.\n"
+            "6. Nao diagnostique doenca e nao substitua avaliacao de profissional competente.\n"
+            "7. Responda SOMENTE em JSON valido, sem markdown, seguindo exatamente a estrutura solicitada.\n\n"
+            "DADOS MEDIDOS:\n" + json.dumps(measured, ensure_ascii=False, indent=2) +
+            "\n\nESTRUTURA JSON ESPERADA:\n" + json.dumps(schema, ensure_ascii=False, indent=2)
+        )
+
+    def _prepare_gemini_image_part(self, record):
+        path = Path(str(record.get("arquivo") or ""))
+        if not path.exists():
+            return None
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                preview_h = int(record.get("preview_height") or 0)
+                if 0 < preview_h < im.height:
+                    im = im.crop((0, 0, im.width, preview_h))
+                long_side = max(im.size)
+                if long_side > GEMINI_IMAGE_LONG_SIDE:
+                    scale = GEMINI_IMAGE_LONG_SIDE / float(long_side)
+                    nw = max(2, int(round(im.width * scale)))
+                    nh = max(2, int(round(im.height * scale)))
+                    res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                    im = im.resize((nw, nh), res)
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=GEMINI_IMAGE_QUALITY, optimize=True)
+                encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+            return {"inline_data": {"mime_type": "image/jpeg", "data": encoded}}
+        except Exception:
+            return None
+
+    def _build_gemini_payload(self, snapshot, evidencias):
+        parts = [{"text": self._build_ai_prompt(snapshot, evidencias)}]
+        image_count = 0
+        for rec in evidencias[:4]:
+            image_part = self._prepare_gemini_image_part(rec)
+            if not image_part:
+                continue
+            factor = str(rec.get("factor_label") or rec.get("factor") or "GERAL").upper()
+            side = str(rec.get("factor_side") or "").strip()
+            value = rec.get("factor_value")
+            parts.append({"text": f"EVIDENCIA VISUAL CRITICA: {factor}{' '+side if side else ''} | valor medido {value}"})
+            parts.append(image_part)
+            image_count += 1
+
+        # Se nenhum fator gerou evidencia, envia o preview atual somente como contexto ambiental.
+        if image_count == 0 and self.camera and self.camera.texture is not None:
+            try:
+                ctx = self._capture_preview_composed()
+                long_side = max(ctx.size)
+                if long_side > GEMINI_IMAGE_LONG_SIDE:
+                    scale = GEMINI_IMAGE_LONG_SIDE / float(long_side)
+                    res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                    ctx = ctx.resize((max(2, int(ctx.width*scale)), max(2, int(ctx.height*scale))), res)
+                buf = io.BytesIO()
+                ctx.save(buf, format="JPEG", quality=GEMINI_IMAGE_QUALITY, optimize=True)
+                parts.append({"text": "IMAGEM DE CONTEXTO DO POSTO: nenhuma evidencia critica automatica foi registrada."})
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}})
+            except Exception:
+                pass
+
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": 0.25,
+                "maxOutputTokens": 2600,
+                "responseMimeType": "application/json",
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def _parse_gemini_response(self, res):
+        parts = (((res or {}).get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        raw = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict)).strip()
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "", 1).replace("```", "").strip()
+        if not raw:
+            raise ValueError("Gemini retornou resposta vazia.")
+        return self._normalise_ai_analysis(json.loads(raw))
+
+    def _save_ai_analysis(self):
+        if not self.ai_analysis:
+            return None
+        try:
+            path = self._assessment_dir() / "analise_ia.json"
+            payload = dict(self.ai_analysis)
+            payload["modelo"] = self.ai_model_used
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return path
+        except Exception:
+            return None
+
+    def _request_ai_for_report(self, snapshot, evidencias, model_index=0, retry_index=0, payload=None):
+        if payload is None:
+            payload = self._build_gemini_payload(snapshot, evidencias)
+        model_index = max(0, min(model_index, len(GEMINI_MODELS) - 1))
+        model = GEMINI_MODELS[model_index]
+        self.status_text = f"IA analisando ambiente e evidencias · {model}..."
+        token = self._ai_request_token
+
+        def ok(req, res):
+            if token != self._ai_request_token:
+                return
+            try:
+                analysis = self._parse_gemini_response(res)
+                self.ai_analysis = analysis
+                self.ai_model_used = model
+                self.ai_last_error = None
+                self._save_ai_analysis()
+                snapshot["analise_ia"] = analysis
+                snapshot["modelo_ia"] = model
+                self._save_assessment_json()
+                self._ai_request_active = False
+                Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis), 0)
+            except Exception as exc:
+                self._handle_ai_final_error(snapshot, evidencias, f"Resposta invalida da IA: {exc}")
+
+        def fail(req, res):
+            if token != self._ai_request_token:
+                return
+            status = int(getattr(req, "resp_status", 0) or 0)
+            detail = ""
+            try:
+                detail = str((res or {}).get("error", {}).get("message") or "")
+            except Exception:
+                detail = str(res or "")[:180]
+            if status in (429, 500, 502, 503, 504) and retry_index < len(GEMINI_RETRY_DELAYS):
+                delay = GEMINI_RETRY_DELAYS[retry_index]
+                self.status_text = f"IA ocupada · nova tentativa em {int(delay)}s..."
+                Clock.schedule_once(
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload),
+                    delay,
+                )
+                return
+            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 429, 500, 502, 503, 504):
+                self.status_text = "Usando modelo IA alternativo..."
+                Clock.schedule_once(
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
+                )
+                return
+            self._handle_ai_final_error(snapshot, evidencias, f"HTTP {status}: {detail}".strip())
+
+        def net(req, err):
+            if token != self._ai_request_token:
+                return
+            if retry_index < len(GEMINI_RETRY_DELAYS):
+                delay = GEMINI_RETRY_DELAYS[retry_index]
+                self.status_text = f"Sem resposta da IA · tentando novamente em {int(delay)}s..."
+                Clock.schedule_once(
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload),
+                    delay,
+                )
+                return
+            if model_index + 1 < len(GEMINI_MODELS):
+                Clock.schedule_once(
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload), 0.8
+                )
+                return
+            self._handle_ai_final_error(snapshot, evidencias, f"Falha de rede: {err}")
+
+        UrlRequest(
+            self._gemini_url(model),
+            req_body=payload,
+            req_headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+            on_success=ok,
+            on_failure=fail,
+            on_error=net,
+            timeout=GEMINI_TIMEOUT,
+        )
+
+    def _handle_ai_final_error(self, snapshot, evidencias, message):
+        self.ai_last_error = self._ai_clip(message, 350)
+        self.ai_analysis = None
+        self.ai_model_used = None
+        self._ai_request_active = False
+        self.status_text = "IA indisponivel. Gerando o PDF tecnico sem a pagina de IA..."
+        Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
 
     # --------------------------- PDF ---------------------------
     def _risk_level_report(self, ire):
@@ -1849,7 +2188,10 @@ class NR17Screen(BoxLayout):
 
         d.line((82, 2260, 1572, 2260), fill=line, width=2)
         d.text((82, 2280), "Pagina 1 | Resumo executivo", font=fonts["tiny"], fill=gray)
-        d.text((1045, 2280), "Detalhe postural na pagina 2", font=fonts["tiny"], fill=navy2)
+        footer_next = "Detalhe postural na pagina 2"
+        if snapshot.get("analise_ia"):
+            footer_next += " · Analise IA nas paginas seguintes"
+        d.text((945, 2280), footer_next, font=fonts["tiny"], fill=navy2)
         return page
 
     def _pdf_posture_page(self, snapshot, total_pages):
@@ -1953,6 +2295,118 @@ class NR17Screen(BoxLayout):
         d.line((82, 2260, 1572, 2260), fill=line, width=2)
         d.text((82, 2280), "Pagina 2 | Detalhe postural", font=fonts["tiny"], fill=gray)
         d.text((1070, 2280), f"Total do relatorio: {total_pages} paginas", font=fonts["tiny"], fill=navy2)
+        return page
+
+    def _pdf_ai_analysis_page(self, snapshot, analysis, page_number, total_pages):
+        W, H = 1654, 2339
+        page = Image.new("RGB", (W, H), (246, 249, 251))
+        d = ImageDraw.Draw(page)
+        navy = (10, 38, 64); navy2 = (18, 62, 96); cyan = (35, 158, 183)
+        dark = (31, 45, 58); gray = (96, 113, 128); line = (215, 225, 233); white = (255,255,255)
+        fonts = {
+            "title": load_report_font(62, True), "section": load_report_font(42, True),
+            "body": load_report_font(32, False), "body_b": load_report_font(32, True),
+            "label": load_report_font(26, True), "small": load_report_font(26, False),
+            "small_b": load_report_font(26, True), "tiny": load_report_font(23, False),
+        }
+        d.rectangle((0,0,W,210), fill=navy); d.rectangle((0,200,W,210), fill=cyan)
+        d.text((82,48), "ANALISE ASSISTIDA DO POSTO", font=fonts["title"], fill=white)
+        d.text((86,132), f"Gemini multimodal | {self.ai_model_used or '-'}", font=fonts["small_b"], fill=(189,215,230))
+        d.text((1370,96), f"{page_number}/{total_pages}", font=fonts["small_b"], fill=white)
+
+        y = 270
+        d.text((82,y), "LEITURA EXECUTIVA", font=fonts["section"], fill=navy); y += 70
+        d.rounded_rectangle((82,y,1572,y+315), radius=24, fill=white, outline=line, width=3)
+        summary = analysis.get("resumo_executivo") or "A IA nao retornou um resumo executivo."
+        draw_wrapped(d, summary, (116,y+40), fonts["body"], dark, 1420, line_gap=10)
+        y += 365
+
+        d.text((82,y), "AMBIENTE OBSERVADO NAS EVIDENCIAS", font=fonts["section"], fill=navy); y += 68
+        env = analysis.get("ambiente_observado") or ["Nenhum elemento ambiental adicional foi confirmado visualmente."]
+        env_h = 330
+        d.rounded_rectangle((82,y,1572,y+env_h), radius=24, fill=(238,245,248), outline=line, width=2)
+        yy = y + 30
+        for item in env[:5]:
+            d.ellipse((112,yy+10,128,yy+26), fill=cyan)
+            yy = draw_wrapped(d, item, (146,yy), fonts["small_b"], dark, 1370, line_gap=7) + 14
+        y += env_h + 60
+
+        d.text((82,y), "ACHADOS POR FATOR", font=fonts["section"], fill=navy); y += 68
+        factors = analysis.get("fatores") or []
+        if not factors:
+            d.rounded_rectangle((82,y,1572,y+220), radius=22, fill=white, outline=line, width=2)
+            d.text((112,y+55), "Nenhum achado especifico por fator foi retornado pela IA.", font=fonts["body"], fill=gray)
+        else:
+            card_gap = 22
+            card_w = int((W - 164 - card_gap) / 2)
+            card_h = 360
+            for i, item in enumerate(factors[:4]):
+                col = i % 2; row = i // 2
+                x = 82 + col*(card_w+card_gap); yy0 = y + row*(card_h+22)
+                d.rounded_rectangle((x,yy0,x+card_w,yy0+card_h), radius=22, fill=white, outline=line, width=2)
+                factor = str(item.get("fator") or "GERAL")
+                crit = str(item.get("criticidade") or "")
+                d.text((x+28,yy0+25), factor, font=fonts["section"], fill=navy2)
+                if crit:
+                    d.text((x+28,yy0+78), f"Criticidade: {crit}", font=fonts["label"], fill=(203,91,39) if crit in ("ALTA","CRITICA") else gray)
+                obs = item.get("observacao") or "Sem observacao adicional."
+                draw_wrapped(d, obs, (x+28,yy0+125), fonts["small"], dark, card_w-56, line_gap=6)
+                causes = item.get("causas_visuais") or []
+                if causes:
+                    d.text((x+28,yy0+274), "Indicacao visual:", font=fonts["label"], fill=gray)
+                    draw_wrapped(d, causes[0], (x+28,yy0+310), fonts["tiny"], gray, card_w-56, line_gap=4)
+
+        d.line((82,2260,1572,2260), fill=line, width=2)
+        d.text((82,2280), "Analise visual assistida por IA; dados posturais permanecem os medidos pelo sistema.", font=fonts["tiny"], fill=gray)
+        return page
+
+    def _pdf_ai_action_page(self, snapshot, analysis, page_number, total_pages):
+        W, H = 1654, 2339
+        page = Image.new("RGB", (W, H), (246, 249, 251)); d = ImageDraw.Draw(page)
+        navy=(10,38,64); navy2=(18,62,96); cyan=(35,158,183); dark=(31,45,58); gray=(96,113,128); line=(215,225,233); white=(255,255,255)
+        fonts = {
+            "title": load_report_font(62, True), "section": load_report_font(42, True),
+            "body": load_report_font(31, False), "body_b": load_report_font(31, True),
+            "label": load_report_font(25, True), "small": load_report_font(25, False),
+            "small_b": load_report_font(25, True), "tiny": load_report_font(23, False),
+            "prio": load_report_font(48, True),
+        }
+        d.rectangle((0,0,W,210), fill=navy); d.rectangle((0,200,W,210), fill=cyan)
+        d.text((82,48), "PLANO DE ACAO SUGERIDO", font=fonts["title"], fill=white)
+        d.text((86,132), "Prioridade para controles na fonte e melhorias de engenharia", font=fonts["small_b"], fill=(189,215,230))
+        d.text((1370,96), f"{page_number}/{total_pages}", font=fonts["small_b"], fill=white)
+
+        y=270
+        d.text((82,y), "ACOES PRIORITARIAS", font=fonts["section"], fill=navy); y+=70
+        plan = analysis.get("plano_acao") or []
+        if not plan:
+            plan = [{"prioridade":1,"acao":"Validar o posto com profissional de ergonomia e confrontar os achados visuais com a atividade real.","tipo":"Validacao","fator":"GERAL","justificativa":"A IA nao retornou acoes especificas suficientes."}]
+        card_h=295
+        for idx,item in enumerate(plan[:5], start=1):
+            if y+card_h > 2060:
+                break
+            d.rounded_rectangle((82,y,1572,y+card_h), radius=24, fill=white, outline=line, width=3)
+            d.rounded_rectangle((108,y+28,220,y+140), radius=20, fill=cyan if idx<=2 else navy2)
+            d.text((142,y+52), str(item.get("prioridade", idx)), font=fonts["prio"], fill=white)
+            x=255
+            draw_wrapped(d, str(item.get("acao") or "Acao nao informada"), (x,y+28), fonts["body_b"], dark, 1260, line_gap=7)
+            d.text((x,y+105), f"TIPO: {str(item.get('tipo') or 'Melhoria').upper()}   |   FATOR: {str(item.get('fator') or 'GERAL').upper()}", font=fonts["label"], fill=navy2)
+            draw_wrapped(d, str(item.get("justificativa") or ""), (x,y+155), fonts["small"], gray, 1260, line_gap=7)
+            y += card_h + 24
+
+        alerts = analysis.get("alertas") or []
+        limits = analysis.get("limitacoes") or []
+        if y < 2110:
+            y += 18
+            d.rounded_rectangle((82,y,1572,min(2220,y+310)), radius=22, fill=(238,245,248), outline=line, width=2)
+            d.text((112,y+24), "VALIDACOES NECESSARIAS", font=fonts["section"], fill=navy)
+            yy=y+86
+            for txt in (alerts + limits)[:4]:
+                d.ellipse((116,yy+8,130,yy+22), fill=cyan)
+                yy = draw_wrapped(d, txt, (148,yy), fonts["small"], dark, 1370, line_gap=6) + 9
+
+        d.line((82,2260,1572,2260), fill=line, width=2)
+        d.text((82,2280), "Sugestoes assistidas por IA devem ser validadas no contexto da AEP/AET antes da implementacao.", font=fonts["tiny"], fill=gray)
         return page
 
     def _pdf_evidence_page(self, record, evidence_index, page_number, total_pages):
@@ -2088,30 +2542,83 @@ class NR17Screen(BoxLayout):
         except Exception:
             return None
 
-    def generate_report(self, *_):
+    def _generate_report_files(self, snapshot, evidencias, ai_analysis=None, ai_failed=False):
         try:
-            evidencias = self._ordered_evidence_records()
-            snapshot = self._assessment_snapshot()
-            snapshot["evidencias"] = list(evidencias)
-            self._save_assessment_json()
-            total_pages = 2 + len(evidencias)
+            snapshot = dict(snapshot or {})
+            snapshot["evidencias"] = list(evidencias or [])
+            snapshot["analise_ia"] = ai_analysis
+            snapshot["modelo_ia"] = self.ai_model_used
+
+            ai_pages = 2 if ai_analysis else 0
+            total_pages = 2 + ai_pages + len(evidencias)
             pages = [
                 self._pdf_summary_page(snapshot),
                 self._pdf_posture_page(snapshot, total_pages),
             ]
+            if ai_analysis:
+                pages.append(self._pdf_ai_analysis_page(snapshot, ai_analysis, 3, total_pages))
+                pages.append(self._pdf_ai_action_page(snapshot, ai_analysis, 4, total_pages))
+
+            evidence_start = 3 + ai_pages
             for idx, record in enumerate(evidencias, start=1):
-                pages.append(self._pdf_evidence_page(record, idx, idx + 2, total_pages))
+                pages.append(self._pdf_evidence_page(record, idx, evidence_start + idx - 1, total_pages))
+
             pdf_name = f"relatorio_NR17_{self.assessment_id}.pdf"
             pdf_path = self._assessment_dir() / pdf_name
             pages[0].save(str(pdf_path), "PDF", resolution=200.0, save_all=True, append_images=pages[1:])
             exported = self._export_report_android(pdf_path)
             self.last_exported_report = exported or str(pdf_path)
+            self._save_assessment_json()
+
             if exported and exported.startswith("content://"):
-                self.status_text = f"PDF gerado e salvo em Downloads/NR17: {pdf_name}"
+                base_msg = f"PDF gerado e salvo em Downloads/NR17: {pdf_name}"
             else:
-                self.status_text = f"PDF gerado: {pdf_path.name}"
+                base_msg = f"PDF gerado: {pdf_path.name}"
+            if ai_failed:
+                base_msg += " · sem analise IA (falha de rede/API)."
+            elif ai_analysis:
+                base_msg += f" · analise IA concluida ({self.ai_model_used})."
+            self.status_text = base_msg
         except Exception as exc:
             self.status_text = f"Erro ao gerar PDF: {exc}"
+        finally:
+            self._ai_request_active = False
+            if getattr(self, "report_btn", None):
+                self.report_btn.disabled = False
+
+    def generate_report(self, *_):
+        if self._ai_request_active:
+            self.status_text = "A analise IA do relatorio ja esta em andamento."
+            return
+        try:
+            evidencias = self._ordered_evidence_records()
+            snapshot = self._assessment_snapshot()
+            snapshot["evidencias"] = list(evidencias)
+            self._save_assessment_json()
+
+            if getattr(self, "report_btn", None):
+                self.report_btn.disabled = True
+
+            # Sem chave: o relatorio tecnico continua funcionando, mas informa claramente.
+            if not GEMINI_API_KEY or "SUA_CHAVE" in GEMINI_API_KEY:
+                self.ai_analysis = None
+                self.ai_model_used = None
+                self.ai_last_error = "GEMINI_API_KEY nao configurada no APK."
+                self.status_text = "Chave Gemini nao configurada. Gerando PDF tecnico sem IA..."
+                Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
+                return
+
+            self._ai_request_active = True
+            self._ai_request_token += 1
+            self.ai_analysis = None
+            self.ai_model_used = None
+            self.ai_last_error = None
+            self._request_ai_for_report(snapshot, evidencias, 0, 0, None)
+        except Exception as exc:
+            self._ai_request_active = False
+            if getattr(self, "report_btn", None):
+                self.report_btn.disabled = False
+            self.status_text = f"Erro preparando relatorio: {exc}"
 
     def reset_measurement(self, *_):
         self._save_assessment_json()
@@ -2126,6 +2633,8 @@ class NR17Screen(BoxLayout):
         self.assessment_started_at = datetime.now()
         self.assessment_id = self.assessment_started_at.strftime("%Y%m%d_%H%M%S")
         self.assessment_dir = None; self.evidence_records = []; self.last_exported_report = None
+        self.ai_analysis = None; self.ai_model_used = None; self.ai_last_error = None
+        self._ai_request_active = False; self._ai_request_token += 1
         self._factor_high_since = {name: None for name in FACTOR_ORDER}
         self._factor_best_severity = {}
         self._auto_evidence_busy = False
