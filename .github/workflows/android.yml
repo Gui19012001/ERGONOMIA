@@ -85,7 +85,7 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.9 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.10 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
@@ -129,11 +129,12 @@ jobs:
 
           # Gemini multimodal - chave vem do GitHub Secret
           GEMINI_API_KEY=$GEMINI_API_KEY
-          GEMINI_MODEL=gemini-2.5-flash
-          GEMINI_FALLBACK_MODEL=gemini-2.5-flash-lite
-          GEMINI_TIMEOUT=75
-          GEMINI_IMAGE_LONG_SIDE=1024
-          GEMINI_IMAGE_QUALITY=82
+          GEMINI_MODEL=gemini-2.5-flash-lite
+          GEMINI_FALLBACK_MODEL=gemini-2.5-flash
+          GEMINI_TIMEOUT=90
+          GEMINI_IMAGE_LONG_SIDE=768
+          GEMINI_IMAGE_QUALITY=72
+          GEMINI_MAX_IMAGES=4
 
           IRE_TRONCO=25
           IRE_PESCOCO=25
