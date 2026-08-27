@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.13"
+APP_VERSION = "0.1.14"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -152,21 +152,28 @@ FACTOR_LABELS = {
 }
 
 # ------------------------------------------------------------------
-# GEMINI - ANALISE MULTIMODAL DO POSTO
-# A chave e injetada pelo GitHub Actions via teste.env.
-# Os modelos abaixo possuem nivel gratuito na Gemini Developer API.
+# SERVICOS DE INTERPRETACAO MULTIMODAL DO POSTO
+# As chaves sao injetadas pelo GitHub Actions via teste.env.
+# Ordem: Gemini Flash-Lite -> Gemini Flash -> Groq Qwen 3.6 Vision -> PDF local.
 # ------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Free tier: Flash-Lite primeiro (mais leve/rápido); Flash como fallback de qualidade.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 GEMINI_MODELS = tuple(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
-# 429 normalmente é quota/rate limit, não simples indisponibilidade momentânea.
-GEMINI_RETRY_DELAYS = (8.0, 20.0)
 GEMINI_TIMEOUT = max(30, env_int("GEMINI_TIMEOUT", 90))
 GEMINI_IMAGE_LONG_SIDE = max(640, min(1280, env_int("GEMINI_IMAGE_LONG_SIDE", 768)))
 GEMINI_IMAGE_QUALITY = max(55, min(90, env_int("GEMINI_IMAGE_QUALITY", 72)))
 GEMINI_MAX_IMAGES = max(1, min(4, env_int("GEMINI_MAX_IMAGES", 4)))
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL", "qwen/qwen3.6-27b"
+).strip() or "qwen/qwen3.6-27b"
+GROQ_TIMEOUT = max(30, env_int("GROQ_TIMEOUT", 75))
+GROQ_IMAGE_LONG_SIDE = max(640, min(1280, env_int("GROQ_IMAGE_LONG_SIDE", 768)))
+GROQ_IMAGE_QUALITY = max(55, min(90, env_int("GROQ_IMAGE_QUALITY", 72)))
+GROQ_MAX_IMAGES = max(1, min(5, env_int("GROQ_MAX_IMAGES", 4)))
+GROQ_RETRY_DELAYS = (4.0, 10.0)
 
 
 # ------------------------------------------------------------------
@@ -2233,6 +2240,9 @@ class NR17Screen(BoxLayout):
     def _gemini_url(self, model):
         return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
+    def _groq_url(self):
+        return "https://api.groq.com/openai/v1/chat/completions"
+
     def _ai_clip(self, value, limit=700):
         text = str(value or "").strip()
         if len(text) <= limit:
@@ -2442,6 +2452,104 @@ class NR17Screen(BoxLayout):
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
+    def _prepare_groq_image_part(self, record):
+        """Converte a mesma evidencia local em data URI para o endpoint OpenAI-compativel da Groq."""
+        path = Path(str(record.get("arquivo") or ""))
+        if not path.exists():
+            return None
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                preview_h = int(record.get("preview_height") or 0)
+                if 0 < preview_h < im.height:
+                    im = im.crop((0, 0, im.width, preview_h))
+                long_side = max(im.size)
+                if long_side > GROQ_IMAGE_LONG_SIDE:
+                    scale = GROQ_IMAGE_LONG_SIDE / float(long_side)
+                    nw = max(2, int(round(im.width * scale)))
+                    nh = max(2, int(round(im.height * scale)))
+                    res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                    im = im.resize((nw, nh), res)
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=GROQ_IMAGE_QUALITY, optimize=True)
+                encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+            }
+        except Exception:
+            return None
+
+    def _build_groq_payload(self, snapshot, evidencias, include_images=True):
+        content = [{"type": "text", "text": self._build_ai_prompt(snapshot, evidencias)}]
+        image_count = 0
+
+        if not include_images:
+            content.append({
+                "type": "text",
+                "text": (
+                    "MODO DE CONTINGENCIA: as imagens nao estao disponiveis para esta tentativa. "
+                    "Baseie a interpretacao EXCLUSIVAMENTE nos dados medidos fornecidos. "
+                    "Nao descreva ambiente, bancada, layout, alcance, iluminacao ou objetos nao informados."
+                ),
+            })
+        else:
+            for rec in evidencias[:GROQ_MAX_IMAGES]:
+                image_part = self._prepare_groq_image_part(rec)
+                if not image_part:
+                    continue
+                factor = str(rec.get("factor_label") or rec.get("factor") or "GERAL").upper()
+                side = str(rec.get("factor_side") or "").strip()
+                value = rec.get("factor_value")
+                content.append({
+                    "type": "text",
+                    "text": f"EVIDENCIA VISUAL CRITICA: {factor}{' '+side if side else ''} | valor medido {value}",
+                })
+                content.append(image_part)
+                image_count += 1
+
+            if image_count == 0 and self.camera and self.camera.texture is not None:
+                try:
+                    ctx = self._capture_preview_composed()
+                    long_side = max(ctx.size)
+                    if long_side > GROQ_IMAGE_LONG_SIDE:
+                        scale = GROQ_IMAGE_LONG_SIDE / float(long_side)
+                        res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                        ctx = ctx.resize((max(2, int(ctx.width*scale)), max(2, int(ctx.height*scale))), res)
+                    buf = io.BytesIO()
+                    ctx.save(buf, format="JPEG", quality=GROQ_IMAGE_QUALITY, optimize=True)
+                    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+                    content.append({
+                        "type": "text",
+                        "text": "IMAGEM DE CONTEXTO DO POSTO: nenhuma evidencia critica automatica foi registrada.",
+                    })
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                    })
+                except Exception:
+                    pass
+
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.25,
+            "max_completion_tokens": 1800,
+            "response_format": {"type": "json_object"},
+        }
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def _parse_groq_response(self, res):
+        try:
+            raw = str((((res or {}).get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        except Exception:
+            raw = ""
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "", 1).replace("```", "").strip()
+        if not raw:
+            raise ValueError("Rota alternativa retornou resposta vazia.")
+        return self._normalise_ai_analysis(json.loads(raw))
+
     def _parse_gemini_response(self, res):
         parts = (((res or {}).get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
         raw = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict)).strip()
@@ -2483,19 +2591,24 @@ class NR17Screen(BoxLayout):
                 message = ""
         return code, api_status, self._ai_clip(message, 500)
 
-    def _save_ai_error(self, model, status, api_status, detail, payload, evidencias):
-        """Salva diagnóstico local para sabermos exatamente por que a API recusou."""
+    def _save_ai_error(self, provider, model, status, api_status, detail, payload, evidencias):
+        """Salva diagnostico local sem expor nenhuma credencial."""
         try:
             info = {
                 "gerado_em": datetime.now().isoformat(timespec="seconds"),
+                "provedor": provider,
                 "modelo": model,
                 "http_status": int(status or 0),
                 "api_status": str(api_status or ""),
                 "mensagem": str(detail or ""),
                 "payload_bytes": len(payload or b""),
-                "imagens": min(len(evidencias or []), GEMINI_MAX_IMAGES),
+                "imagens": min(
+                    len(evidencias or []),
+                    GROQ_MAX_IMAGES if str(provider).lower() == "groq" else GEMINI_MAX_IMAGES,
+                ),
             }
-            path = self._assessment_dir() / "erro_analise.json"
+            safe_provider = str(provider or "servico").lower().replace("/", "_")
+            path = self._assessment_dir() / f"erro_analise_{safe_provider}.json"
             path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
             return path
         except Exception:
@@ -2518,12 +2631,24 @@ class NR17Screen(BoxLayout):
         return f"Falha do servico HTTP {status or 0}." + (f" {detail[:120]}" if detail else "")
 
     def _request_ai_for_report(self, snapshot, evidencias, model_index=0, retry_index=0, payload=None, text_only=False):
+        """Primeira rota: Gemini. Ao esgotar as rotas Google, segue automaticamente para Groq."""
+        if not GEMINI_API_KEY or "SUA_CHAVE" in GEMINI_API_KEY:
+            self.status_text = "Rota principal nao configurada · tentando rota alternativa..."
+            Clock.schedule_once(lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, False), 0)
+            return
+
         if payload is None:
             payload = self._build_gemini_payload(snapshot, evidencias, include_images=not text_only)
         model_index = max(0, min(model_index, len(GEMINI_MODELS) - 1))
         model = GEMINI_MODELS[model_index]
-        self.status_text = f"Analisando ambiente e evidencias..."
+        self.status_text = "Analisando ambiente e evidencias..."
         token = self._ai_request_token
+
+        def use_groq(reason=""):
+            if token != self._ai_request_token:
+                return
+            self.status_text = "Rota principal indisponivel · tentando interpretacao alternativa..."
+            Clock.schedule_once(lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, False), 0.3)
 
         def ok(req, res):
             if token != self._ai_request_token:
@@ -2531,84 +2656,56 @@ class NR17Screen(BoxLayout):
             try:
                 analysis = self._parse_gemini_response(res)
                 analysis["fonte_analise"] = "somente_dados" if text_only else "dados_e_evidencias"
+                analysis["provedor"] = "gemini"
                 self.ai_analysis = analysis
-                self.ai_model_used = model
+                self.ai_model_used = f"gemini:{model}"
                 self.ai_last_error = None
                 self._save_ai_analysis()
                 snapshot["analise_assistida"] = analysis
-                snapshot["motor_analise"] = model
+                snapshot["motor_analise"] = self.ai_model_used
                 snapshot["fonte_analise"] = analysis.get("fonte_analise")
                 self._save_assessment_json()
                 self._ai_request_active = False
                 Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis), 0)
             except Exception as exc:
-                self._handle_ai_final_error(snapshot, evidencias, f"Resposta invalida da analise complementar: {exc}")
+                use_groq(f"resposta invalida: {exc}")
 
         def fail(req, res):
             if token != self._ai_request_token:
                 return
             raw_status = int(getattr(req, "resp_status", 0) or 0)
             status, api_status, detail = self._gemini_error_info(res, raw_status)
-            self._save_ai_error(model, status, api_status, detail, payload, evidencias)
+            self._save_ai_error("gemini", model, status, api_status, detail, payload, evidencias)
 
-            # Se o problema estiver no conteudo multimodal, repete automaticamente somente com dados.
+            # Erro de conteudo visual: tenta a mesma rota apenas com os dados medidos.
             if (status == 400 or api_status.upper() == "INVALID_ARGUMENT") and not text_only:
-                self.status_text = "Analise visual indisponivel · repetindo somente com os dados medidos..."
+                self.status_text = "Analise visual recusada · repetindo com os dados medidos..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, 0, None, True), 0.5
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, 0, None, True), 0.4
                 )
                 return
 
-            # 429: tenta o outro modelo do free tier imediatamente antes de esperar.
-            if (status == 429 or api_status.upper() == "RESOURCE_EXHAUSTED") and model_index + 1 < len(GEMINI_MODELS) and retry_index == 0:
-                self.status_text = "Limite do servico atingido · tentando rota alternativa..."
+            # Quota/modelo/servidor: troca primeiro entre os dois modelos Gemini.
+            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 429, 500, 502, 503, 504):
+                self.status_text = "Tentando segunda rota de interpretacao..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload, text_only), 0.8
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, None, text_only), 0.5
                 )
                 return
 
-            # Erros temporários: espera de verdade antes de repetir.
-            if status in (429, 500, 502, 503, 504) and retry_index < len(GEMINI_RETRY_DELAYS):
-                delay = GEMINI_RETRY_DELAYS[retry_index]
-                label = "limite/quota" if status == 429 else "servico temporariamente indisponivel"
-                self.status_text = f"Servico de interpretacao: {label} · nova tentativa em {int(delay)}s..."
-                Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload, text_only),
-                    delay,
-                )
-                return
-
-            # Modelo inexistente: troca de modelo; 400/403 não adianta repetir cegamente.
-            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 500, 502, 503, 504):
-                self.status_text = "Tentando rota alternativa de interpretacao..."
-                Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload, text_only), 0.8
-                )
-                return
-
-            friendly = self._friendly_ai_error(status, api_status, detail)
-            self._handle_ai_final_error(
-                snapshot, evidencias,
-                f"{friendly} API={api_status or '-'} | {detail}".strip(),
-            )
+            # Depois dos dois modelos Google, muda de provedor imediatamente.
+            use_groq(self._friendly_ai_error(status, api_status, detail))
 
         def net(req, err):
             if token != self._ai_request_token:
                 return
-            if retry_index < len(GEMINI_RETRY_DELAYS):
-                delay = GEMINI_RETRY_DELAYS[retry_index]
-                self.status_text = f"Sem resposta do servico · tentando novamente em {int(delay)}s..."
-                Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, retry_index + 1, payload, text_only),
-                    delay,
-                )
-                return
             if model_index + 1 < len(GEMINI_MODELS):
+                self.status_text = "Sem resposta da rota principal · tentando segunda rota..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, payload, text_only), 0.8
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, None, text_only), 0.5
                 )
                 return
-            self._handle_ai_final_error(snapshot, evidencias, f"Falha de rede: {err}")
+            use_groq(f"falha de rede: {err}")
 
         UrlRequest(
             self._gemini_url(model),
@@ -2618,6 +2715,109 @@ class NR17Screen(BoxLayout):
             on_failure=fail,
             on_error=net,
             timeout=GEMINI_TIMEOUT,
+        )
+
+    def _request_groq_for_report(self, snapshot, evidencias, retry_index=0, payload=None, text_only=False):
+        """Rota independente: Groq + Qwen 3.6 Vision, com imagem e JSON mode."""
+        if not GROQ_API_KEY or "SUA_CHAVE" in GROQ_API_KEY:
+            self._handle_ai_final_error(
+                snapshot, evidencias,
+                "Rotas externas indisponiveis ou nao configuradas. O relatorio tecnico local foi preservado.",
+            )
+            return
+
+        if payload is None:
+            payload = self._build_groq_payload(snapshot, evidencias, include_images=not text_only)
+        token = self._ai_request_token
+        self.status_text = "Tentando rota alternativa de interpretacao..."
+
+        def ok(req, res):
+            if token != self._ai_request_token:
+                return
+            try:
+                analysis = self._parse_groq_response(res)
+                analysis["fonte_analise"] = "somente_dados" if text_only else "dados_e_evidencias"
+                analysis["provedor"] = "groq"
+                self.ai_analysis = analysis
+                self.ai_model_used = f"groq:{GROQ_MODEL}"
+                self.ai_last_error = None
+                self._save_ai_analysis()
+                snapshot["analise_assistida"] = analysis
+                snapshot["motor_analise"] = self.ai_model_used
+                snapshot["fonte_analise"] = analysis.get("fonte_analise")
+                self._save_assessment_json()
+                self._ai_request_active = False
+                Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis), 0)
+            except Exception as exc:
+                if not text_only:
+                    self.status_text = "Resposta visual alternativa invalida · tentando apenas dados medidos..."
+                    Clock.schedule_once(
+                        lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, True), 0.4
+                    )
+                    return
+                self._handle_ai_final_error(snapshot, evidencias, f"Resposta alternativa invalida: {exc}")
+
+        def fail(req, res):
+            if token != self._ai_request_token:
+                return
+            status = int(getattr(req, "resp_status", 0) or 0)
+            detail = ""
+            api_status = ""
+            try:
+                err = (res or {}).get("error", {}) if isinstance(res, dict) else {}
+                if isinstance(err, dict):
+                    detail = str(err.get("message") or "").strip()
+                    api_status = str(err.get("type") or err.get("code") or "").strip()
+            except Exception:
+                detail = str(res or "")[:500]
+            self._save_ai_error("groq", GROQ_MODEL, status, api_status, detail, payload, evidencias)
+
+            # Se a imagem for recusada, ainda preserva a interpretacao baseada apenas nos dados.
+            if status == 400 and not text_only:
+                self.status_text = "Rota visual alternativa recusada · tentando somente dados medidos..."
+                Clock.schedule_once(
+                    lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, True), 0.4
+                )
+                return
+
+            if status in (429, 500, 502, 503, 504) and retry_index < len(GROQ_RETRY_DELAYS):
+                delay = GROQ_RETRY_DELAYS[retry_index]
+                self.status_text = f"Rota alternativa temporariamente indisponivel · nova tentativa em {int(delay)}s..."
+                Clock.schedule_once(
+                    lambda dt: self._request_groq_for_report(snapshot, evidencias, retry_index + 1, payload, text_only),
+                    delay,
+                )
+                return
+
+            self._handle_ai_final_error(
+                snapshot, evidencias,
+                f"Rota alternativa HTTP {status or 0}: {self._ai_clip(detail, 220)}",
+            )
+
+        def net(req, err):
+            if token != self._ai_request_token:
+                return
+            if retry_index < len(GROQ_RETRY_DELAYS):
+                delay = GROQ_RETRY_DELAYS[retry_index]
+                self.status_text = f"Sem resposta da rota alternativa · nova tentativa em {int(delay)}s..."
+                Clock.schedule_once(
+                    lambda dt: self._request_groq_for_report(snapshot, evidencias, retry_index + 1, payload, text_only),
+                    delay,
+                )
+                return
+            self._handle_ai_final_error(snapshot, evidencias, f"Falha de rede na rota alternativa: {err}")
+
+        UrlRequest(
+            self._groq_url(),
+            req_body=payload,
+            req_headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+            },
+            on_success=ok,
+            on_failure=fail,
+            on_error=net,
+            timeout=GROQ_TIMEOUT,
         )
 
     def _handle_ai_final_error(self, snapshot, evidencias, message):
@@ -3467,12 +3667,13 @@ class NR17Screen(BoxLayout):
             if getattr(self, "report_btn", None):
                 self.report_btn.disabled = True
 
-            # Sem chave: o relatorio tecnico continua funcionando, mas informa claramente.
-            if not GEMINI_API_KEY or "SUA_CHAVE" in GEMINI_API_KEY:
+            gemini_ok = bool(GEMINI_API_KEY and "SUA_CHAVE" not in GEMINI_API_KEY)
+            groq_ok = bool(GROQ_API_KEY and "SUA_CHAVE" not in GROQ_API_KEY)
+            if not gemini_ok and not groq_ok:
                 self.ai_analysis = None
                 self.ai_model_used = None
-                self.ai_last_error = "Servico de interpretacao nao configurado no APK."
-                self.status_text = "Servico de interpretacao nao configurado. Gerando PDF tecnico..."
+                self.ai_last_error = "Servicos de interpretacao nao configurados no APK."
+                self.status_text = "Interpretacao complementar nao configurada. Gerando PDF tecnico..."
                 Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
                 return
 
@@ -3481,7 +3682,10 @@ class NR17Screen(BoxLayout):
             self.ai_analysis = None
             self.ai_model_used = None
             self.ai_last_error = None
-            self._request_ai_for_report(snapshot, evidencias, 0, 0, None)
+            if gemini_ok:
+                self._request_ai_for_report(snapshot, evidencias, 0, 0, None)
+            else:
+                self._request_groq_for_report(snapshot, evidencias, 0, None, False)
         except Exception as exc:
             self._ai_request_active = False
             if getattr(self, "report_btn", None):
