@@ -85,7 +85,7 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.11 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.12 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
@@ -108,6 +108,7 @@ jobs:
 
           CAMERA_WIDTH=1280
           CAMERA_HEIGHT=720
+          CAMERA_RESTART_DELAY=0.65
 
           POSE_INPUT_LONG_SIDE=640
           POSE_INTERVAL=0.12
@@ -127,7 +128,7 @@ jobs:
           AUTO_EVIDENCE_DELTA_ARM=3.0
           AUTO_EVIDENCE_DELTA_KNEE=3.0
 
-          # Gemini multimodal - chave vem do GitHub Secret
+          # Servico de interpretacao multimodal - chave vem do GitHub Secret
           GEMINI_API_KEY=$GEMINI_API_KEY
           GEMINI_MODEL=gemini-2.5-flash-lite
           GEMINI_FALLBACK_MODEL=gemini-2.5-flash
@@ -154,7 +155,7 @@ jobs:
           echo "GEMINI_API_KEY=***CONFIGURADA VIA SECRET***"
           echo "========================================"
           echo "No APK: calibracao da camera e salva automaticamente"
-          echo "Relatorio: dados + imagens criticas -> Gemini -> plano de acao"
+          echo "Relatorio: dados + imagens criticas -> interpretacao complementar -> plano de acao"
           echo "========================================"
 
       # ==========================================================
