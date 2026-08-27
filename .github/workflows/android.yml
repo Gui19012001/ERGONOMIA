@@ -85,16 +85,22 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.13 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.14 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
       - name: Criar configuracao tablet
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           if [ -z "$GEMINI_API_KEY" ]; then
             echo "ERRO: crie o Repository Secret GEMINI_API_KEY antes do build."
+            exit 1
+          fi
+
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "ERRO: crie o Repository Secret GROQ_API_KEY antes do build."
             exit 1
           fi
 
@@ -142,6 +148,14 @@ jobs:
           GEMINI_IMAGE_QUALITY=72
           GEMINI_MAX_IMAGES=4
 
+          # Rota independente de contingencia - Groq / Qwen 3.6 Vision
+          GROQ_API_KEY=$GROQ_API_KEY
+          GROQ_MODEL=qwen/qwen3.6-27b
+          GROQ_TIMEOUT=75
+          GROQ_IMAGE_LONG_SIDE=768
+          GROQ_IMAGE_QUALITY=72
+          GROQ_MAX_IMAGES=4
+
           IRE_TRONCO=25
           IRE_PESCOCO=25
           IRE_BRACO=60
@@ -156,11 +170,12 @@ jobs:
           echo "========================================"
           echo "CONFIGURACAO PADRAO DO TABLET"
           echo "========================================"
-          grep -v '^GEMINI_API_KEY=' teste.env
+          grep -v -E '^(GEMINI_API_KEY|GROQ_API_KEY)=' teste.env
           echo "GEMINI_API_KEY=***CONFIGURADA VIA SECRET***"
+          echo "GROQ_API_KEY=***CONFIGURADA VIA SECRET***"
           echo "========================================"
           echo "No APK: calibracao da camera e salva automaticamente"
-          echo "Relatorio: dados + imagens criticas -> interpretacao complementar -> plano de acao"
+          echo "Relatorio: Gemini -> Groq/Qwen 3.6 Vision -> contingencia por dados -> PDF tecnico"
           echo "========================================"
 
       # ==========================================================
