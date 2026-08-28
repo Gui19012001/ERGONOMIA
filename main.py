@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.14"
+APP_VERSION = "0.1.16"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -152,28 +152,27 @@ FACTOR_LABELS = {
 }
 
 # ------------------------------------------------------------------
-# SERVICOS DE INTERPRETACAO MULTIMODAL DO POSTO
+# SERVICOS DE INTERPRETACAO DO POSTO
 # As chaves sao injetadas pelo GitHub Actions via teste.env.
-# Ordem: Gemini Flash-Lite -> Gemini Flash -> Groq Qwen 3.6 Vision -> PDF local.
+# Gemini: leitura visual (dados + evidencias).
+# Groq: contingencia economica SOMENTE com dados quantitativos, sem imagens.
+# Ordem: Gemini 2.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 2.5 Flash -> Groq dados -> PDF local.
 # ------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+GEMINI_SECOND_MODEL = os.getenv("GEMINI_SECOND_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-GEMINI_MODELS = tuple(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
+GEMINI_MODELS = tuple(dict.fromkeys([GEMINI_MODEL, GEMINI_SECOND_MODEL, GEMINI_FALLBACK_MODEL]))
 GEMINI_TIMEOUT = max(30, env_int("GEMINI_TIMEOUT", 90))
 GEMINI_IMAGE_LONG_SIDE = max(640, min(1280, env_int("GEMINI_IMAGE_LONG_SIDE", 768)))
 GEMINI_IMAGE_QUALITY = max(55, min(90, env_int("GEMINI_IMAGE_QUALITY", 72)))
 GEMINI_MAX_IMAGES = max(1, min(4, env_int("GEMINI_MAX_IMAGES", 4)))
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL", "qwen/qwen3.6-27b"
-).strip() or "qwen/qwen3.6-27b"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b").strip() or "qwen/qwen3.6-27b"
 GROQ_TIMEOUT = max(30, env_int("GROQ_TIMEOUT", 75))
-GROQ_IMAGE_LONG_SIDE = max(640, min(1280, env_int("GROQ_IMAGE_LONG_SIDE", 768)))
-GROQ_IMAGE_QUALITY = max(55, min(90, env_int("GROQ_IMAGE_QUALITY", 72)))
-GROQ_MAX_IMAGES = max(1, min(5, env_int("GROQ_MAX_IMAGES", 4)))
-GROQ_RETRY_DELAYS = (4.0, 10.0)
+GROQ_MAX_OUTPUT_TOKENS = max(700, min(2200, env_int("GROQ_MAX_OUTPUT_TOKENS", 1400)))
+GROQ_RETRY_DELAYS = (5.0, 15.0)
 
 
 # ------------------------------------------------------------------
@@ -2307,6 +2306,60 @@ class NR17Screen(BoxLayout):
             "limitacoes": self._ai_list(data.get("limitacoes") or [], 3, 260),
         }
 
+    def _measured_excesses(self, snapshot, evidencias):
+        """Calcula explicitamente o excesso/deficit em graus para o fallback sem imagem."""
+        by_factor = {}
+        for rec in (evidencias or []):
+            factor = str(rec.get("factor") or "").strip().lower()
+            if factor:
+                by_factor[factor] = rec
+
+        peak = dict(snapshot.get("pico") or {})
+
+        def num(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def high_item(factor, fallback_value, limit):
+            rec = by_factor.get(factor) or {}
+            value = num(rec.get("factor_value"))
+            if value is None:
+                value = num(fallback_value)
+            excess = None if value is None else max(0.0, value - float(limit))
+            return {
+                "valor_graus": None if value is None else round(value, 2),
+                "limite_graus": round(float(limit), 2),
+                "excesso_graus": None if excess is None else round(excess, 2),
+                "situacao": "acima_do_limite" if excess is not None and excess > 0 else "dentro_do_limite",
+            }
+
+        def low_item(factor, fallback_value, limit):
+            rec = by_factor.get(factor) or {}
+            value = num(rec.get("factor_value"))
+            if value is None:
+                value = num(fallback_value)
+            deficit = None if value is None else max(0.0, float(limit) - value)
+            return {
+                "valor_graus": None if value is None else round(value, 2),
+                "limite_graus": round(float(limit), 2),
+                "deficit_graus": None if deficit is None else round(deficit, 2),
+                "situacao": "abaixo_do_limite" if deficit is not None and deficit > 0 else "dentro_do_limite",
+            }
+
+        arm_values = [num(peak.get("shoulder_r")), num(peak.get("shoulder_l"))]
+        arm_values = [v for v in arm_values if v is not None]
+        knee_values = [num(peak.get("knee_r")), num(peak.get("knee_l"))]
+        knee_values = [v for v in knee_values if v is not None]
+
+        return {
+            "tronco": high_item("trunk", peak.get("trunk"), TRUNK_LIMIT),
+            "pescoco": high_item("neck", peak.get("neck"), NECK_LIMIT),
+            "braco": high_item("arm", max(arm_values) if arm_values else None, ARM_LIMIT),
+            "joelho": low_item("knee", min(knee_values) if knee_values else None, KNEE_LIMIT),
+        }
+
     def _build_ai_prompt(self, snapshot, evidencias):
         measured = {
             "setor": snapshot.get("setor") or "nao informado",
@@ -2327,6 +2380,7 @@ class NR17Screen(BoxLayout):
                 "braco_graus": ARM_LIMIT,
                 "joelho_graus": KNEE_LIMIT,
             },
+            "excessos_calculados": self._measured_excesses(snapshot, evidencias),
             "pico": snapshot.get("pico") or {},
             "evidencias": [
                 {
@@ -2342,38 +2396,39 @@ class NR17Screen(BoxLayout):
             ],
         }
         schema = {
-            "resumo_executivo": "texto curto e objetivo",
-            "ambiente_observado": ["elemento visivel do ambiente/posto"],
+            "resumo_executivo": "maximo 80 palavras",
+            "ambiente_observado": ["maximo 4 itens; vazio se nao houver imagem"],
             "fatores": [{
                 "fator": "TRONCO|PESCOCO|BRACO|JOELHO|GERAL",
                 "criticidade": "BAIXA|MODERADA|ALTA|CRITICA",
-                "observacao": "o que os dados e a imagem sustentam",
-                "causas_visuais": ["possivel causa visivel, sem inventar"],
-                "acoes": ["acao pratica priorizando engenharia/fonte"],
+                "observacao": "valor, limite, excesso/deficit e exposicao; maximo 60 palavras",
+                "causas_visuais": ["somente se realmente visivel"],
+                "acoes": ["maximo 2 acoes objetivas"],
             }],
             "plano_acao": [{
                 "prioridade": 1,
-                "acao": "acao objetiva",
+                "acao": "acao objetiva; maximo 30 palavras",
                 "tipo": "Engenharia|Layout|Dispositivo|Organizacao|Treinamento|Validacao",
                 "fator": "fator relacionado",
-                "justificativa": "por que esta acao e prioritaria",
+                "justificativa": "maximo 35 palavras",
             }],
-            "alertas": ["ponto que merece validacao humana"],
-            "limitacoes": ["o que nao pode ser concluido apenas pelas imagens/dados"],
+            "alertas": ["maximo 3"],
+            "limitacoes": ["maximo 3"],
         }
         return (
             "Voce atua como assistente tecnico de ergonomia industrial para apoiar uma AEP/AET. "
-            "Analise as imagens do posto e os DADOS MEDIDOS abaixo.\n\n"
+            "Analise as evidencias visuais quando existirem e os DADOS MEDIDOS abaixo.\n\n"
             "REGRAS OBRIGATORIAS:\n"
-            "1. IRE, RULA, REBA e angulos sao dados medidos pelo sistema. NAO recalcule, NAO corrija e NAO substitua esses valores.\n"
-            "2. Use as imagens para analisar SOMENTE elementos realmente visiveis do ambiente, alcance, altura aparente, posicionamento, apoio, layout e relacao operador-posto.\n"
-            "3. Nao invente peso, forca, frequencia, repetitividade, duracao de ciclo, dimensoes ou condicoes que nao estejam nos dados. Quando algo nao puder ser confirmado, diga que precisa de validacao.\n"
-            "4. Proponha acoes na hierarquia: eliminar/reduzir na fonte e engenharia primeiro; layout/dispositivo depois; organizacao depois; treinamento/comportamento por ultimo.\n"
-            "5. As acoes devem ser praticas para ambiente industrial e diretamente relacionadas aos achados.\n"
-            "6. Nao diagnostique doenca e nao substitua avaliacao de profissional competente.\n"
-            "7. Responda SOMENTE em JSON valido, sem markdown, seguindo exatamente a estrutura solicitada.\n\n"
-            "DADOS MEDIDOS:\n" + json.dumps(measured, ensure_ascii=False, indent=2) +
-            "\n\nESTRUTURA JSON ESPERADA:\n" + json.dumps(schema, ensure_ascii=False, indent=2)
+            "1. IRE, RULA, REBA, angulos, limites, exposicoes e excessos_calculados sao dados do sistema. NAO recalcule, NAO corrija e NAO substitua esses valores.\n"
+            "2. PRIORIZE os pontos fora do limite. Cite o valor em graus, o limite e o excesso/deficit em graus, relacionando com o percentual de exposicao.\n"
+            "3. Use imagens SOMENTE para elementos realmente visiveis do ambiente, alcance, altura aparente, posicionamento, apoio e layout.\n"
+            "4. Se nao houver imagem, produza a interpretacao normalmente com base em excessos_calculados, exposicoes, RULA, REBA e IRE; ambiente_observado deve ficar vazio.\n"
+            "5. Nao invente peso, forca, frequencia, repetitividade, duracao de ciclo, dimensoes ou condicoes nao fornecidas.\n"
+            "6. Priorize controles na fonte/engenharia, depois layout/dispositivo, organizacao e por ultimo treinamento.\n"
+            "7. Nao diagnostique doenca e nao substitua avaliacao profissional competente.\n"
+            "8. Seja conciso. Responda SOMENTE em JSON valido, sem markdown, seguindo a estrutura solicitada.\n\n"
+            "DADOS MEDIDOS:\n" + json.dumps(measured, ensure_ascii=False, separators=(",", ":")) +
+            "\n\nESTRUTURA JSON ESPERADA:\n" + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
         )
 
     def _prepare_gemini_image_part(self, record):
@@ -2452,91 +2507,133 @@ class NR17Screen(BoxLayout):
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    def _prepare_groq_image_part(self, record):
-        """Converte a mesma evidencia local em data URI para o endpoint OpenAI-compativel da Groq."""
-        path = Path(str(record.get("arquivo") or ""))
-        if not path.exists():
-            return None
-        try:
-            with Image.open(path) as im:
-                im = im.convert("RGB")
-                preview_h = int(record.get("preview_height") or 0)
-                if 0 < preview_h < im.height:
-                    im = im.crop((0, 0, im.width, preview_h))
-                long_side = max(im.size)
-                if long_side > GROQ_IMAGE_LONG_SIDE:
-                    scale = GROQ_IMAGE_LONG_SIDE / float(long_side)
-                    nw = max(2, int(round(im.width * scale)))
-                    nh = max(2, int(round(im.height * scale)))
-                    res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-                    im = im.resize((nw, nh), res)
-                buf = io.BytesIO()
-                im.save(buf, format="JPEG", quality=GROQ_IMAGE_QUALITY, optimize=True)
-                encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-            return {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-            }
-        except Exception:
-            return None
+    def _groq_quantitative_data(self, snapshot, evidencias):
+        """Monta somente os dados numericos necessarios para a contingencia Groq."""
+        evidence_by_factor = {
+            str(r.get("factor")): r for r in (evidencias or []) if r.get("factor")
+        }
+        peak = dict(snapshot.get("pico") or {})
 
-    def _build_groq_payload(self, snapshot, evidencias, include_images=True):
-        content = [{"type": "text", "text": self._build_ai_prompt(snapshot, evidencias)}]
-        image_count = 0
+        def num(v):
+            try:
+                return round(float(v), 2)
+            except Exception:
+                return None
 
-        if not include_images:
-            content.append({
-                "type": "text",
-                "text": (
-                    "MODO DE CONTINGENCIA: as imagens nao estao disponiveis para esta tentativa. "
-                    "Baseie a interpretacao EXCLUSIVAMENTE nos dados medidos fornecidos. "
-                    "Nao descreva ambiente, bancada, layout, alcance, iluminacao ou objetos nao informados."
-                ),
+        arms = [v for v in (peak.get("shoulder_r"), peak.get("shoulder_l")) if v is not None]
+        knees = [v for v in (peak.get("knee_r"), peak.get("knee_l")) if v is not None]
+        peak_defaults = {
+            "trunk": num(peak.get("trunk")),
+            "neck": num(peak.get("neck")),
+            "arm": num(max(arms)) if arms else None,
+            "knee": num(min(knees)) if knees else None,
+        }
+        limits = {
+            "trunk": float(TRUNK_LIMIT),
+            "neck": float(NECK_LIMIT),
+            "arm": float(ARM_LIMIT),
+            "knee": float(KNEE_LIMIT),
+        }
+        exposures = {
+            "trunk": snapshot.get("exposicao_tronco_pct", 0),
+            "neck": snapshot.get("exposicao_pescoco_pct", 0),
+            "arm": snapshot.get("exposicao_braco_pct", 0),
+            "knee": snapshot.get("exposicao_joelho_pct", 0),
+        }
+
+        factors = []
+        for factor in FACTOR_ORDER:
+            rec = evidence_by_factor.get(factor) or {}
+            value = num(rec.get("factor_value"))
+            if value is None:
+                value = peak_defaults.get(factor)
+            limit = num(rec.get("factor_limit"))
+            if limit is None:
+                limit = num(limits[factor])
+
+            deviation = None
+            outside = False
+            if value is not None and limit is not None:
+                if factor == "knee":
+                    deviation = round(max(0.0, limit - value), 2)
+                    outside = value <= limit
+                else:
+                    deviation = round(max(0.0, value - limit), 2)
+                    outside = value >= limit
+
+            factors.append({
+                "fator": FACTOR_LABELS.get(factor, factor.upper()),
+                "valor_graus": value,
+                "limite_graus": limit,
+                "desvio_fora_limite_graus": deviation,
+                "fora_limite": bool(outside),
+                "exposicao_pct": num(exposures.get(factor, 0)) or 0.0,
+                "lado": rec.get("factor_side"),
             })
-        else:
-            for rec in evidencias[:GROQ_MAX_IMAGES]:
-                image_part = self._prepare_groq_image_part(rec)
-                if not image_part:
-                    continue
-                factor = str(rec.get("factor_label") or rec.get("factor") or "GERAL").upper()
-                side = str(rec.get("factor_side") or "").strip()
-                value = rec.get("factor_value")
-                content.append({
-                    "type": "text",
-                    "text": f"EVIDENCIA VISUAL CRITICA: {factor}{' '+side if side else ''} | valor medido {value}",
-                })
-                content.append(image_part)
-                image_count += 1
 
-            if image_count == 0 and self.camera and self.camera.texture is not None:
-                try:
-                    ctx = self._capture_preview_composed()
-                    long_side = max(ctx.size)
-                    if long_side > GROQ_IMAGE_LONG_SIDE:
-                        scale = GROQ_IMAGE_LONG_SIDE / float(long_side)
-                        res = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-                        ctx = ctx.resize((max(2, int(ctx.width*scale)), max(2, int(ctx.height*scale))), res)
-                    buf = io.BytesIO()
-                    ctx.save(buf, format="JPEG", quality=GROQ_IMAGE_QUALITY, optimize=True)
-                    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-                    content.append({
-                        "type": "text",
-                        "text": "IMAGEM DE CONTEXTO DO POSTO: nenhuma evidencia critica automatica foi registrada.",
-                    })
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-                    })
-                except Exception:
-                    pass
+        return {
+            "setor": snapshot.get("setor") or "nao informado",
+            "posto": snapshot.get("posto") or "nao informado",
+            "tempo_valido_s": num(snapshot.get("tempo_valido_s", 0)) or 0.0,
+            "eventos": int(snapshot.get("eventos", 0) or 0),
+            "ciclos": len(snapshot.get("ciclos") or []),
+            "ire_max": int(snapshot.get("max_ire", 0) or 0),
+            "rula_max": int(snapshot.get("max_rula", 0) or 0),
+            "reba_max": int(snapshot.get("max_reba", 0) or 0),
+            "exposicao_total_pct": num(snapshot.get("exposicao_total_pct", 0)) or 0.0,
+            "fatores": factors,
+        }
 
+    def _build_groq_text_prompt(self, snapshot, evidencias):
+        data = self._groq_quantitative_data(snapshot, evidencias)
+        schema = {
+            "resumo_executivo": "maximo 3 frases",
+            "ambiente_observado": [],
+            "fatores": [{
+                "fator": "TRONCO|PESCOCO|BRACO|JOELHO|GERAL",
+                "criticidade": "BAIXA|MODERADA|ALTA|CRITICA",
+                "observacao": "interpretacao objetiva dos numeros",
+                "causas_visuais": [],
+                "acoes": ["maximo 2 acoes tecnicas"],
+            }],
+            "plano_acao": [{
+                "prioridade": 1,
+                "acao": "acao objetiva sem inventar a causa do posto",
+                "tipo": "Engenharia|Layout|Dispositivo|Organizacao|Treinamento|Validacao",
+                "fator": "fator relacionado",
+                "justificativa": "relacione com valor, limite, desvio e/ou exposicao",
+            }],
+            "alertas": ["maximo 3 validacoes em campo"],
+            "limitacoes": ["analise feita somente com dados, sem imagem"],
+        }
+        return (
+            "Voce apoia uma triagem ergonomica industrial. NESTA ROTA NAO EXISTEM IMAGENS. "
+            "Use EXCLUSIVAMENTE os dados quantitativos fornecidos.\n\n"
+            "REGRAS OBRIGATORIAS:\n"
+            "1. Nao descreva nem suponha ambiente, bancada, layout, caixas, ferramentas, alturas, distancias, iluminacao ou objetos.\n"
+            "2. ambiente_observado e causas_visuais DEVEM ser listas vazias.\n"
+            "3. Nao altere IRE, RULA, REBA, angulos, limites ou percentuais medidos.\n"
+            "4. Priorize fatores com maior desvio fora do limite e maior percentual de exposicao.\n"
+            "5. Para joelho, desvio fora do limite significa quanto o angulo ficou ABAIXO do limite configurado.\n"
+            "6. O plano de acao deve atacar o fator biomecanico observado, mas a causa fisica deve ser indicada como ponto a validar em campo quando nao estiver nos dados.\n"
+            "7. Gere no maximo 4 acoes prioritarias e seja conciso para economizar tokens.\n"
+            "8. Responda SOMENTE JSON valido, sem markdown.\n\n"
+            "DADOS QUANTITATIVOS:\n" + json.dumps(data, ensure_ascii=False, separators=(",", ":")) +
+            "\n\nESTRUTURA JSON:\n" + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    def _build_groq_payload(self, snapshot, evidencias, json_mode=True):
         payload = {
             "model": GROQ_MODEL,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0.25,
-            "max_completion_tokens": 1800,
-            "response_format": {"type": "json_object"},
+            "messages": [{
+                "role": "user",
+                "content": self._build_groq_text_prompt(snapshot, evidencias),
+            }],
+            "temperature": 0.15,
+            "max_completion_tokens": GROQ_MAX_OUTPUT_TOKENS,
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     def _parse_groq_response(self, res):
@@ -2548,7 +2645,14 @@ class NR17Screen(BoxLayout):
             raw = raw.replace("```json", "", 1).replace("```", "").strip()
         if not raw:
             raise ValueError("Rota alternativa retornou resposta vazia.")
-        return self._normalise_ai_analysis(json.loads(raw))
+        try:
+            data = json.loads(raw)
+        except Exception:
+            ini, fim = raw.find("{"), raw.rfind("}")
+            if ini < 0 or fim <= ini:
+                raise
+            data = json.loads(raw[ini:fim + 1])
+        return self._normalise_ai_analysis(data)
 
     def _parse_gemini_response(self, res):
         parts = (((res or {}).get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -2602,9 +2706,8 @@ class NR17Screen(BoxLayout):
                 "api_status": str(api_status or ""),
                 "mensagem": str(detail or ""),
                 "payload_bytes": len(payload or b""),
-                "imagens": min(
-                    len(evidencias or []),
-                    GROQ_MAX_IMAGES if str(provider).lower() == "groq" else GEMINI_MAX_IMAGES,
+                "imagens": 0 if str(provider).lower() == "groq" else min(
+                    len(evidencias or []), GEMINI_MAX_IMAGES
                 ),
             }
             safe_provider = str(provider or "servico").lower().replace("/", "_")
@@ -2618,6 +2721,8 @@ class NR17Screen(BoxLayout):
         status = int(status or 0)
         api_status = str(api_status or "").upper()
         detail = str(detail or "").strip()
+        if status == 413:
+            return "Carga visual excedeu o limite da rota gratuita (HTTP 413)."
         if status == 429 or api_status == "RESOURCE_EXHAUSTED":
             return "Limite gratuito/quota do servico atingido (HTTP 429)."
         if status == 400 or api_status == "INVALID_ARGUMENT":
@@ -2634,11 +2739,11 @@ class NR17Screen(BoxLayout):
         """Primeira rota: Gemini. Ao esgotar as rotas Google, segue automaticamente para Groq."""
         if not GEMINI_API_KEY or "SUA_CHAVE" in GEMINI_API_KEY:
             self.status_text = "Rota principal nao configurada · tentando rota alternativa..."
-            Clock.schedule_once(lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, False), 0)
+            Clock.schedule_once(lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, True), 0)
             return
 
         if payload is None:
-            payload = self._build_gemini_payload(snapshot, evidencias, include_images=not text_only)
+            payload = self._build_gemini_payload(snapshot, evidencias, include_images=True)
         model_index = max(0, min(model_index, len(GEMINI_MODELS) - 1))
         model = GEMINI_MODELS[model_index]
         self.status_text = "Analisando ambiente e evidencias..."
@@ -2648,14 +2753,14 @@ class NR17Screen(BoxLayout):
             if token != self._ai_request_token:
                 return
             self.status_text = "Rota principal indisponivel · tentando interpretacao alternativa..."
-            Clock.schedule_once(lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, False), 0.3)
+            Clock.schedule_once(lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, True), 0.3)
 
         def ok(req, res):
             if token != self._ai_request_token:
                 return
             try:
                 analysis = self._parse_gemini_response(res)
-                analysis["fonte_analise"] = "somente_dados" if text_only else "dados_e_evidencias"
+                analysis["fonte_analise"] = "dados_e_evidencias"
                 analysis["provedor"] = "gemini"
                 self.ai_analysis = analysis
                 self.ai_model_used = f"gemini:{model}"
@@ -2677,19 +2782,12 @@ class NR17Screen(BoxLayout):
             status, api_status, detail = self._gemini_error_info(res, raw_status)
             self._save_ai_error("gemini", model, status, api_status, detail, payload, evidencias)
 
-            # Erro de conteudo visual: tenta a mesma rota apenas com os dados medidos.
-            if (status == 400 or api_status.upper() == "INVALID_ARGUMENT") and not text_only:
-                self.status_text = "Analise visual recusada · repetindo com os dados medidos..."
+            # Gemini e reservado para leitura visual. Se a imagem/formato for recusado,
+            # tenta o proximo modelo Gemini ainda com evidencias; depois segue para Groq SOMENTE DADOS.
+            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 400, 404, 429, 500, 502, 503, 504):
+                self.status_text = "Tentando segunda rota visual de interpretacao..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index, 0, None, True), 0.4
-                )
-                return
-
-            # Quota/modelo/servidor: troca primeiro entre os dois modelos Gemini.
-            if model_index + 1 < len(GEMINI_MODELS) and status in (0, 404, 429, 500, 502, 503, 504):
-                self.status_text = "Tentando segunda rota de interpretacao..."
-                Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, None, text_only), 0.5
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, None, False), 0.5
                 )
                 return
 
@@ -2702,7 +2800,7 @@ class NR17Screen(BoxLayout):
             if model_index + 1 < len(GEMINI_MODELS):
                 self.status_text = "Sem resposta da rota principal · tentando segunda rota..."
                 Clock.schedule_once(
-                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, None, text_only), 0.5
+                    lambda dt: self._request_ai_for_report(snapshot, evidencias, model_index + 1, 0, None, False), 0.5
                 )
                 return
             use_groq(f"falha de rede: {err}")
@@ -2717,45 +2815,49 @@ class NR17Screen(BoxLayout):
             timeout=GEMINI_TIMEOUT,
         )
 
-    def _request_groq_for_report(self, snapshot, evidencias, retry_index=0, payload=None, text_only=False):
-        """Rota independente: Groq + Qwen 3.6 Vision, com imagem e JSON mode."""
+    def _request_groq_for_report(self, snapshot, evidencias, retry_index=0, payload=None, json_mode=True):
+        """Rota economica: Groq recebe SOMENTE dados numericos; nenhuma imagem e enviada."""
         if not GROQ_API_KEY or "SUA_CHAVE" in GROQ_API_KEY:
             self._handle_ai_final_error(
                 snapshot, evidencias,
-                "Rotas externas indisponiveis ou nao configuradas. O relatorio tecnico local foi preservado.",
+                "Rota quantitativa nao configurada. O relatorio tecnico local foi preservado.",
             )
             return
 
         if payload is None:
-            payload = self._build_groq_payload(snapshot, evidencias, include_images=not text_only)
+            payload = self._build_groq_payload(snapshot, evidencias, json_mode=json_mode)
         token = self._ai_request_token
-        self.status_text = "Tentando rota alternativa de interpretacao..."
+        self.status_text = "Interpretacao quantitativa de contingencia · analisando graus e exposicoes..."
 
         def ok(req, res):
             if token != self._ai_request_token:
                 return
             try:
                 analysis = self._parse_groq_response(res)
-                analysis["fonte_analise"] = "somente_dados" if text_only else "dados_e_evidencias"
+                analysis["fonte_analise"] = "somente_dados"
                 analysis["provedor"] = "groq"
+                analysis["ambiente_observado"] = []
+                for item in analysis.get("fatores") or []:
+                    if isinstance(item, dict):
+                        item["causas_visuais"] = []
                 self.ai_analysis = analysis
-                self.ai_model_used = f"groq:{GROQ_MODEL}"
+                self.ai_model_used = f"groq:{GROQ_MODEL}:somente_dados"
                 self.ai_last_error = None
                 self._save_ai_analysis()
                 snapshot["analise_assistida"] = analysis
                 snapshot["motor_analise"] = self.ai_model_used
-                snapshot["fonte_analise"] = analysis.get("fonte_analise")
+                snapshot["fonte_analise"] = "somente_dados"
                 self._save_assessment_json()
                 self._ai_request_active = False
                 Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis), 0)
             except Exception as exc:
-                if not text_only:
-                    self.status_text = "Resposta visual alternativa invalida · tentando apenas dados medidos..."
+                if json_mode:
+                    self.status_text = "Resposta quantitativa incompleta · repetindo em JSON simples..."
                     Clock.schedule_once(
-                        lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, True), 0.4
+                        lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, False), 0.4
                     )
                     return
-                self._handle_ai_final_error(snapshot, evidencias, f"Resposta alternativa invalida: {exc}")
+                self._handle_ai_final_error(snapshot, evidencias, f"Resposta quantitativa invalida: {exc}")
 
         def fail(req, res):
             if token != self._ai_request_token:
@@ -2772,26 +2874,32 @@ class NR17Screen(BoxLayout):
                 detail = str(res or "")[:500]
             self._save_ai_error("groq", GROQ_MODEL, status, api_status, detail, payload, evidencias)
 
-            # Se a imagem for recusada, ainda preserva a interpretacao baseada apenas nos dados.
-            if status == 400 and not text_only:
-                self.status_text = "Rota visual alternativa recusada · tentando somente dados medidos..."
+            detail_l = detail.lower()
+            # Alguns modelos podem falhar na validacao do JSON estruturado. Sem imagem,
+            # a segunda tentativa remove apenas o response_format e mantem o prompt JSON.
+            if status == 400 and json_mode and (
+                "json" in detail_l or "validate" in detail_l or "response_format" in detail_l
+            ):
+                self.status_text = "Validacao JSON da contingencia recusada · repetindo em modo simples..."
                 Clock.schedule_once(
-                    lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, True), 0.4
+                    lambda dt: self._request_groq_for_report(snapshot, evidencias, 0, None, False), 0.4
                 )
                 return
 
-            if status in (429, 500, 502, 503, 504) and retry_index < len(GROQ_RETRY_DELAYS):
+            if status in (413, 429, 500, 502, 503, 504) and retry_index < len(GROQ_RETRY_DELAYS):
                 delay = GROQ_RETRY_DELAYS[retry_index]
-                self.status_text = f"Rota alternativa temporariamente indisponivel · nova tentativa em {int(delay)}s..."
+                self.status_text = f"Rota quantitativa temporariamente indisponivel · nova tentativa em {int(delay)}s..."
                 Clock.schedule_once(
-                    lambda dt: self._request_groq_for_report(snapshot, evidencias, retry_index + 1, payload, text_only),
+                    lambda dt: self._request_groq_for_report(
+                        snapshot, evidencias, retry_index + 1, payload, json_mode
+                    ),
                     delay,
                 )
                 return
 
             self._handle_ai_final_error(
                 snapshot, evidencias,
-                f"Rota alternativa HTTP {status or 0}: {self._ai_clip(detail, 220)}",
+                f"Rota quantitativa HTTP {status or 0}: {self._ai_clip(detail, 220)}",
             )
 
         def net(req, err):
@@ -2799,13 +2907,15 @@ class NR17Screen(BoxLayout):
                 return
             if retry_index < len(GROQ_RETRY_DELAYS):
                 delay = GROQ_RETRY_DELAYS[retry_index]
-                self.status_text = f"Sem resposta da rota alternativa · nova tentativa em {int(delay)}s..."
+                self.status_text = f"Sem resposta da rota quantitativa · nova tentativa em {int(delay)}s..."
                 Clock.schedule_once(
-                    lambda dt: self._request_groq_for_report(snapshot, evidencias, retry_index + 1, payload, text_only),
+                    lambda dt: self._request_groq_for_report(
+                        snapshot, evidencias, retry_index + 1, payload, json_mode
+                    ),
                     delay,
                 )
                 return
-            self._handle_ai_final_error(snapshot, evidencias, f"Falha de rede na rota alternativa: {err}")
+            self._handle_ai_final_error(snapshot, evidencias, f"Falha de rede na rota quantitativa: {err}")
 
         UrlRequest(
             self._groq_url(),
@@ -3294,8 +3404,15 @@ class NR17Screen(BoxLayout):
             "small_b": load_report_font(26, True), "tiny": load_report_font(23, False),
         }
         d.rectangle((0,0,W,210), fill=navy); d.rectangle((0,200,W,210), fill=cyan)
-        d.text((82,48), "INTERPRETACAO ASSISTIDA DOS ACHADOS", font=fonts["title"], fill=white)
-        d.text((86,132), f"Interpretacao complementar baseada em dados e evidencias", font=fonts["small_b"], fill=(189,215,230))
+        data_only = str(analysis.get("fonte_analise") or "") == "somente_dados"
+        page_title = "INTERPRETACAO QUANTITATIVA DOS ACHADOS" if data_only else "INTERPRETACAO ASSISTIDA DOS ACHADOS"
+        page_subtitle = (
+            "Contingencia baseada exclusivamente nos dados medidos · sem leitura de imagens"
+            if data_only else
+            "Interpretacao complementar baseada em dados e evidencias"
+        )
+        d.text((82,48), page_title, font=fonts["title"], fill=white)
+        d.text((86,132), page_subtitle, font=fonts["small_b"], fill=(189,215,230))
         d.text((1370,96), f"{page_number}/{total_pages}", font=fonts["small_b"], fill=white)
 
         y = 270
@@ -3305,15 +3422,27 @@ class NR17Screen(BoxLayout):
         draw_wrapped(d, summary, (116,y+40), fonts["body"], dark, 1420, line_gap=10)
         y += 365
 
-        d.text((82,y), "AMBIENTE OBSERVADO NAS EVIDENCIAS", font=fonts["section"], fill=navy); y += 68
-        env = analysis.get("ambiente_observado") or ["Nenhum elemento ambiental adicional foi confirmado visualmente."]
-        env_h = 330
-        d.rounded_rectangle((82,y,1572,y+env_h), radius=24, fill=(238,245,248), outline=line, width=2)
-        yy = y + 30
-        for item in env[:5]:
-            d.ellipse((112,yy+10,128,yy+26), fill=cyan)
-            yy = draw_wrapped(d, item, (146,yy), fonts["small_b"], dark, 1370, line_gap=7) + 14
-        y += env_h + 60
+        if data_only:
+            d.text((82,y), "BASE DA CONTINGENCIA", font=fonts["section"], fill=navy); y += 68
+            env_h = 330
+            d.rounded_rectangle((82,y,1572,y+env_h), radius=24, fill=(238,245,248), outline=line, width=2)
+            note = (
+                "A rota de contingencia nao recebeu imagens. Esta pagina interpreta somente angulos, limites, "
+                "desvios fora do limite, percentuais de exposicao, IRE, RULA e REBA. Caracteristicas fisicas "
+                "do ambiente e causas do posto devem ser confirmadas em campo."
+            )
+            draw_wrapped(d, note, (116,y+48), fonts["small_b"], dark, 1400, line_gap=9)
+            y += env_h + 60
+        else:
+            d.text((82,y), "AMBIENTE OBSERVADO NAS EVIDENCIAS", font=fonts["section"], fill=navy); y += 68
+            env = analysis.get("ambiente_observado") or ["Nenhum elemento ambiental adicional foi confirmado visualmente."]
+            env_h = 330
+            d.rounded_rectangle((82,y,1572,y+env_h), radius=24, fill=(238,245,248), outline=line, width=2)
+            yy = y + 30
+            for item in env[:5]:
+                d.ellipse((112,yy+10,128,yy+26), fill=cyan)
+                yy = draw_wrapped(d, item, (146,yy), fonts["small_b"], dark, 1370, line_gap=7) + 14
+            y += env_h + 60
 
         d.text((82,y), "ACHADOS POR FATOR", font=fonts["section"], fill=navy); y += 68
         factors = analysis.get("fatores") or []
@@ -3341,7 +3470,12 @@ class NR17Screen(BoxLayout):
                     draw_wrapped(d, causes[0], (x+28,yy0+310), fonts["tiny"], gray, card_w-56, line_gap=4)
 
         d.line((82,2260,1572,2260), fill=line, width=2)
-        d.text((82,2280), "Interpretacao assistida das evidencias; dados posturais permanecem os medidos pelo sistema.", font=fonts["tiny"], fill=gray)
+        footer = (
+            "Contingencia quantitativa: nenhuma imagem foi enviada; plano baseado nos dados medidos."
+            if data_only else
+            "Interpretacao assistida das evidencias; dados posturais permanecem os medidos pelo sistema."
+        )
+        d.text((82,2280), footer, font=fonts["tiny"], fill=gray)
         return page
 
     def _ai_action_fonts(self):
@@ -3685,7 +3819,7 @@ class NR17Screen(BoxLayout):
             if gemini_ok:
                 self._request_ai_for_report(snapshot, evidencias, 0, 0, None)
             else:
-                self._request_groq_for_report(snapshot, evidencias, 0, None, False)
+                self._request_groq_for_report(snapshot, evidencias, 0, None, True)
         except Exception as exc:
             self._ai_request_active = False
             if getattr(self, "report_btn", None):
