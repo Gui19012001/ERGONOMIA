@@ -85,7 +85,7 @@ jobs:
       #
       # IMPORTANTE:
       # Estes valores são apenas o padrão do primeiro uso.
-      # No APK 0.1.14 o usuário pode alterar rotação e espelhamento
+      # No APK 0.1.16 o usuário pode alterar rotação e espelhamento
       # em ⚙ CÂMERA e salvar localmente no tablet.
       # Não é mais necessário recompilar o APK para calibrar.
       # ==========================================================
@@ -142,19 +142,19 @@ jobs:
           # Servico de interpretacao multimodal - chave vem do GitHub Secret
           GEMINI_API_KEY=$GEMINI_API_KEY
           GEMINI_MODEL=gemini-2.5-flash-lite
+          GEMINI_SECOND_MODEL=gemini-3.1-flash-lite
           GEMINI_FALLBACK_MODEL=gemini-2.5-flash
           GEMINI_TIMEOUT=90
           GEMINI_IMAGE_LONG_SIDE=768
           GEMINI_IMAGE_QUALITY=72
           GEMINI_MAX_IMAGES=4
 
-          # Rota independente de contingencia - Groq / Qwen 3.6 Vision
+          # Rota independente de contingencia - Groq SOMENTE DADOS
+          # Nenhuma imagem/evidencia e enviada para a Groq.
           GROQ_API_KEY=$GROQ_API_KEY
           GROQ_MODEL=qwen/qwen3.6-27b
           GROQ_TIMEOUT=75
-          GROQ_IMAGE_LONG_SIDE=768
-          GROQ_IMAGE_QUALITY=72
-          GROQ_MAX_IMAGES=4
+          GROQ_MAX_OUTPUT_TOKENS=1400
 
           IRE_TRONCO=25
           IRE_PESCOCO=25
@@ -175,7 +175,7 @@ jobs:
           echo "GROQ_API_KEY=***CONFIGURADA VIA SECRET***"
           echo "========================================"
           echo "No APK: calibracao da camera e salva automaticamente"
-          echo "Relatorio: Gemini -> Groq/Qwen 3.6 Vision -> contingencia por dados -> PDF tecnico"
+          echo "Relatorio: 3 rotas Gemini visuais -> Groq somente dados quantitativos -> PDF tecnico"
           echo "========================================"
 
       # ==========================================================
