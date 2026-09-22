@@ -1,5 +1,5 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.13
+# NR-17 | ERGONOMIA POR VISÃO - ANDROID LOCAL MVP 0.1.18
 # Kivy + ML Kit local + calibração em tempo real + evidências + PDF
 # ============================================================
 
@@ -35,7 +35,7 @@ from kivy.utils import platform
 from PIL import Image, ImageDraw, ImageFont
 
 APP_TITLE = "NR-17 | Ergonomia por Visão"
-APP_VERSION = "0.1.16"
+APP_VERSION = "0.1.18"
 
 # ------------------------------------------------------------------
 # VISUAL
@@ -2930,14 +2930,156 @@ class NR17Screen(BoxLayout):
             timeout=GROQ_TIMEOUT,
         )
 
+    def _build_local_quantitative_analysis(self, snapshot, evidencias):
+        """Contingencia deterministica local: nunca deixa o PDF perder interpretacao/plano de acao."""
+        data = self._groq_quantitative_data(snapshot, evidencias)
+        raw_factors = list(data.get("fatores") or [])
+
+        def criticality(dev, exp, outside):
+            dev = float(dev or 0)
+            exp = float(exp or 0)
+            if not outside and exp < 5:
+                return "BAIXA"
+            if dev >= 20 or exp >= 60:
+                return "CRITICA"
+            if dev >= 10 or exp >= 35:
+                return "ALTA"
+            if dev > 0 or exp >= 15:
+                return "MODERADA"
+            return "BAIXA"
+
+        action_templates = {
+            "TRONCO": (
+                "Revisar a configuracao da tarefa e os pontos de alcance para reduzir a flexao do tronco e favorecer postura mais proxima da neutra.",
+                "Engenharia",
+            ),
+            "PESCOCO": (
+                "Revisar o posicionamento do campo visual e das referencias da tarefa para reduzir flexao ou inclinacao sustentada do pescoco.",
+                "Engenharia",
+            ),
+            "BRACO": (
+                "Revisar alturas e alcances operacionais, dispositivos e pontos de manipulacao para reduzir a permanencia dos bracos acima do limite configurado.",
+                "Engenharia",
+            ),
+            "JOELHO": (
+                "Avaliar apoio, altura de trabalho e possibilidade de alternancia postural para reduzir flexao excessiva dos joelhos.",
+                "Layout",
+            ),
+        }
+
+        factors = []
+        ranked = []
+        for item in raw_factors:
+            factor = str(item.get("fator") or "GERAL").upper()
+            value = item.get("valor_graus")
+            limit = item.get("limite_graus")
+            dev = float(item.get("desvio_fora_limite_graus") or 0)
+            exp = float(item.get("exposicao_pct") or 0)
+            outside = bool(item.get("fora_limite"))
+            crit = criticality(dev, exp, outside)
+            if value is None or limit is None:
+                obs = f"{factor}: dados angulares insuficientes para comparacao completa; exposicao registrada {exp:.1f}%."
+            elif factor == "JOELHO":
+                obs = (
+                    f"{factor}: menor angulo observado {float(value):.1f} graus, limite configurado {float(limit):.1f} graus, "
+                    f"deficit fora do limite {dev:.1f} graus e exposicao de {exp:.1f}% do tempo valido."
+                )
+            else:
+                obs = (
+                    f"{factor}: pico observado {float(value):.1f} graus, limite configurado {float(limit):.1f} graus, "
+                    f"excesso fora do limite {dev:.1f} graus e exposicao de {exp:.1f}% do tempo valido."
+                )
+            factors.append({
+                "fator": factor,
+                "criticidade": crit,
+                "observacao": obs,
+                "causas_visuais": [],
+                "acoes": [],
+            })
+            score = dev * 2.0 + exp + (25 if outside else 0)
+            ranked.append((score, factor, dev, exp, outside))
+
+        ranked.sort(reverse=True, key=lambda x: x[0])
+        top_names = [x[1] for x in ranked if x[4] or x[3] >= 5][:2]
+        if top_names:
+            resumo = (
+                "A leitura quantitativa local identificou maior prioridade nos fatores "
+                + " e ".join(top_names)
+                + f". RULA maximo {data.get('rula_max',0)}/7, REBA maximo {data.get('reba_max',0)}/15 "
+                + f"e exposicao global {float(data.get('exposicao_total_pct',0) or 0):.1f}%."
+            )
+        else:
+            resumo = (
+                f"A leitura quantitativa local nao identificou exposicoes posturais relevantes acima dos limites configurados. "
+                f"RULA maximo {data.get('rula_max',0)}/7 e REBA maximo {data.get('reba_max',0)}/15."
+            )
+
+        plan = []
+        p = 1
+        for score, factor, dev, exp, outside in ranked:
+            if not outside and exp < 5:
+                continue
+            action, kind = action_templates.get(
+                factor,
+                ("Revisar em campo a origem do fator postural e definir medida preventiva proporcional a exposicao registrada.", "Validacao"),
+            )
+            metric = (
+                f"desvio de {dev:.1f} graus e exposicao de {exp:.1f}%"
+                if dev > 0 else f"exposicao de {exp:.1f}%"
+            )
+            plan.append({
+                "prioridade": p,
+                "acao": action,
+                "tipo": kind,
+                "fator": factor,
+                "justificativa": f"Prioridade definida pelos dados medidos: {metric}. A causa fisica deve ser confirmada em campo.",
+            })
+            p += 1
+            if len(plan) >= 4:
+                break
+
+        plan.append({
+            "prioridade": p,
+            "acao": "Validar em campo carga/forca, frequencia, repetitividade, duracao dos ciclos, variabilidade da tarefa e organizacao do trabalho.",
+            "tipo": "Validacao",
+            "fator": "GERAL",
+            "justificativa": "Essas variaveis nao sao determinadas apenas pelos angulos e percentuais registrados pela visao computacional.",
+        })
+
+        return {
+            "status": "ok",
+            "gerado_em": datetime.now().isoformat(timespec="seconds"),
+            "resumo_executivo": resumo,
+            "ambiente_observado": [],
+            "fatores": factors[:4],
+            "plano_acao": plan[:5],
+            "alertas": [
+                "Confirmar em campo a causa operacional de cada postura antes de alterar o posto.",
+                "Confrontar os achados com a atividade real e com a percepcao dos trabalhadores.",
+            ],
+            "limitacoes": [
+                "Contingencia local baseada somente em dados posturais; nenhuma imagem foi interpretada nesta etapa.",
+                "Peso, forca, frequencia, repetitividade e organizacao do trabalho exigem validacao complementar.",
+            ],
+            "fonte_analise": "somente_dados",
+            "provedor": "motor_local",
+        }
+
     def _handle_ai_final_error(self, snapshot, evidencias, message):
         self.ai_last_error = self._ai_clip(message, 350)
-        self.ai_analysis = None
-        self.ai_model_used = None
+        analysis = self._build_local_quantitative_analysis(snapshot, evidencias)
+        self.ai_analysis = analysis
+        self.ai_model_used = "local:quantitativo"
+        snapshot["analise_assistida"] = analysis
+        snapshot["motor_analise"] = self.ai_model_used
+        snapshot["fonte_analise"] = "somente_dados"
+        self._save_ai_analysis()
+        self._save_assessment_json()
         self._ai_request_active = False
-        self.status_text = f"Analise complementar indisponivel: {self.ai_last_error} · gerando PDF tecnico..."
-        Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
+        self.status_text = "Servicos externos indisponiveis · usando interpretacao quantitativa local e gerando relatorio completo..."
+        Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis, ai_failed=False), 0)
 
+    # --------------------------- PDF ---------------------------
     # --------------------------- PDF ---------------------------
     def _risk_level_report(self, ire):
         ire = int(ire or 0)
@@ -2949,12 +3091,20 @@ class NR17Screen(BoxLayout):
             return "ATENCAO", (226, 169, 45), "Acompanhar a exposicao e revisar oportunidades de melhoria."
         return "BAIXO", (46, 160, 104), "Baixa exposicao visual no periodo analisado."
 
+    def _pdf_shadow_card(self, d, box, radius=24, fill=(255,255,255), outline=(211,223,232), width=2, offset=9):
+        """Card visual com sombra leve para dar profundidade sem perder legibilidade."""
+        x1, y1, x2, y2 = box
+        shadow = (222, 230, 236)
+        d.rounded_rectangle((x1+offset, y1+offset, x2+offset, y2+offset), radius=radius, fill=shadow)
+        d.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
     def _pdf_metric_card(self, d, box, label, value, accent, fonts, note=None):
         x1, y1, x2, y2 = box
-        d.rounded_rectangle(box, radius=24, fill=(255, 255, 255), outline=(211, 223, 232), width=3)
-        d.rounded_rectangle((x1, y1, x1 + 12, y2), radius=6, fill=accent)
-        d.text((x1 + 34, y1 + 24), str(label), font=fonts["label"], fill=(92, 109, 124))
-        d.text((x1 + 34, y1 + 72), str(value), font=fonts["metric"], fill=(17, 48, 76))
+        self._pdf_shadow_card(d, box, radius=24, fill=(255,255,255), outline=(211,223,232), width=2, offset=8)
+        d.rounded_rectangle((x1, y1, x1 + 14, y2), radius=7, fill=accent)
+        d.rounded_rectangle((x1 + 34, y1 + 22, x1 + 220, y1 + 58), radius=16, fill=(239, 245, 248))
+        d.text((x1 + 46, y1 + 27), str(label), font=fonts["label"], fill=(92, 109, 124))
+        d.text((x1 + 34, y1 + 78), str(value), font=fonts["metric"], fill=(17, 48, 76))
         if note:
             d.text((x1 + 34, y2 - 40), str(note), font=fonts["tiny"], fill=(111, 127, 141))
 
@@ -2971,6 +3121,9 @@ class NR17Screen(BoxLayout):
         by = y + 48
         bar_h = 42
         d.rounded_rectangle((x1, by, x2, by + bar_h), radius=21, fill=(226, 234, 240))
+        for frac in (0.25, 0.50, 0.75):
+            mx = x1 + (x2 - x1) * frac
+            d.line((mx, by + 8, mx, by + bar_h - 8), fill=(199, 211, 220), width=2)
         fill_w = (x2 - x1) * clamp(pct / 100.0, 0, 1)
         col = (
             (214, 52, 71) if pct >= 70 else
@@ -2983,8 +3136,8 @@ class NR17Screen(BoxLayout):
 
     def _pdf_field(self, d, box, label, value, fonts, accent=(35, 158, 183)):
         x1, y1, x2, y2 = box
-        d.rounded_rectangle(box, radius=20, fill=(250, 252, 253), outline=(215, 225, 233), width=2)
-        d.rectangle((x1, y1, x1 + 7, y2), fill=accent)
+        self._pdf_shadow_card(d, box, radius=20, fill=(252,253,254), outline=(215,225,233), width=2, offset=6)
+        d.rounded_rectangle((x1, y1, x1 + 9, y2), radius=4, fill=accent)
         d.text((x1 + 26, y1 + 18), str(label).upper(), font=fonts["label"], fill=(101, 116, 130))
         value = str(value or "-")
         draw_wrapped(d, value, (x1 + 26, y1 + 60), fonts["body_b"], (30, 44, 57), x2 - x1 - 52, line_gap=6)
@@ -3022,6 +3175,8 @@ class NR17Screen(BoxLayout):
         d.text((82, 48), "NR-17 | RELATORIO ERGONOMICO", font=fonts["title"], fill=white)
         d.text((86, 132), "Triagem postural assistida por visao computacional", font=fonts["subtitle"], fill=(196, 219, 232))
         d.text((86, 192), f"Avaliacao {snapshot.get('assessment_id', '-')}", font=fonts["small_b"], fill=(160, 198, 219))
+        d.rounded_rectangle((1180, 42, 1568, 112), radius=28, fill=(18, 62, 96), outline=(35, 158, 183), width=2)
+        d.text((1220, 64), "AEP/AET  •  RULA  •  REBA", font=fonts["label"], fill=white)
 
         y = 320
         d.text((82, y), "IDENTIFICACAO", font=fonts["section"], fill=navy)
@@ -3069,7 +3224,7 @@ class NR17Screen(BoxLayout):
 
         y += 225
         level, level_color, level_desc = self._risk_level_report(snapshot.get("max_ire", 0))
-        d.rounded_rectangle((82, y, 1572, y + 165), radius=24, fill=white, outline=level_color, width=4)
+        self._pdf_shadow_card(d, (82, y, 1572, y + 165), radius=24, fill=white, outline=level_color, width=4, offset=8)
         d.rounded_rectangle((108, y + 28, 470, y + 136), radius=18, fill=level_color)
         d.text((142, y + 53), f"RISCO {level}", font=fonts["risk"], fill=white)
         draw_wrapped(d, level_desc, (510, y + 30), fonts["body_b"], dark, 1000, line_gap=8)
@@ -3295,7 +3450,7 @@ class NR17Screen(BoxLayout):
         ]
         card_h=235
         for title,body in refs:
-            d.rounded_rectangle((82,y,1572,y+card_h), radius=22, fill=(250,252,253), outline=line, width=2)
+            self._pdf_shadow_card(d, (82,y,1572,y+card_h), radius=22, fill=(250,252,253), outline=line, width=2, offset=6)
             d.rectangle((82,y,92,y+card_h), fill=cyan)
             d.text((116,y+26),title,font=fonts["body_b"],fill=navy2)
             draw_wrapped(d,body,(116,y+78),fonts["small"],dark,1410,line_gap=7)
@@ -3338,7 +3493,7 @@ class NR17Screen(BoxLayout):
         gap=18; cw=int((W-164-gap*3)/4)
         for i,(lab,val) in enumerate(vals):
             x=82+i*(cw+gap)
-            d.rounded_rectangle((x,y,x+cw,y+165),radius=20,fill=white,outline=line,width=2)
+            self._pdf_shadow_card(d, (x,y,x+cw,y+165), radius=20, fill=white, outline=line, width=2, offset=6)
             d.text((x+22,y+20),lab,font=fonts["label"],fill=gray)
             d.text((x+22,y+67),val,font=fonts["metric"],fill=navy2)
         y+=205
@@ -3356,7 +3511,7 @@ class NR17Screen(BoxLayout):
             ("RULA",f"{rula}/7",self._rula_reference_text(rula)),
             ("REBA",f"{reba}/15",self._reba_reference_text(reba)),
         ]:
-            d.rounded_rectangle((82,y,1572,y+175),radius=22,fill=(250,252,253),outline=line,width=2)
+            self._pdf_shadow_card(d, (82,y,1572,y+175), radius=22, fill=(250,252,253), outline=line, width=2, offset=6)
             d.text((112,y+24),lab,font=fonts["section"],fill=navy2)
             d.text((350,y+25),val,font=fonts["metric"],fill=cyan)
             draw_wrapped(d,body,(580,y+35),fonts["body_b"],dark,930,line_gap=6)
@@ -3384,7 +3539,7 @@ class NR17Screen(BoxLayout):
             "Os achados podem subsidiar a priorizacao de medidas preventivas e o aprofundamento da AEP/AET. "
             "A decisao final deve considerar as variaveis nao capturadas automaticamente e a validacao da atividade em campo."
         )
-        d.rounded_rectangle((82,y,1572,y+300),radius=22,fill=white,outline=cyan,width=3)
+        self._pdf_shadow_card(d, (82,y,1572,y+300), radius=22, fill=white, outline=cyan, width=3, offset=8)
         draw_wrapped(d,conclusion,(112,y+38),fonts["body_b"],dark,1410,line_gap=9)
 
         d.line((82,2260,1572,2260),fill=line,width=2)
@@ -3417,9 +3572,13 @@ class NR17Screen(BoxLayout):
 
         y = 270
         d.text((82,y), "LEITURA EXECUTIVA", font=fonts["section"], fill=navy); y += 70
-        d.rounded_rectangle((82,y,1572,y+315), radius=24, fill=white, outline=line, width=3)
+        self._pdf_shadow_card(d, (82,y,1572,y+315), radius=24, fill=white, outline=line, width=3, offset=8)
+        d.rounded_rectangle((82,y,96,y+315), radius=7, fill=cyan)
+        source_label = "BASE QUANTITATIVA" if data_only else "DADOS + EVIDENCIAS VISUAIS"
+        d.rounded_rectangle((114,y+28,520,y+70), radius=18, fill=(235,245,248))
+        d.text((136,y+35), source_label, font=fonts["label"], fill=navy2)
         summary = analysis.get("resumo_executivo") or "A analise complementar nao retornou um resumo executivo."
-        draw_wrapped(d, summary, (116,y+40), fonts["body"], dark, 1420, line_gap=10)
+        draw_wrapped(d, summary, (116,y+92), fonts["body"], dark, 1420, line_gap=10)
         y += 365
 
         if data_only:
@@ -3456,18 +3615,26 @@ class NR17Screen(BoxLayout):
             for i, item in enumerate(factors[:4]):
                 col = i % 2; row = i // 2
                 x = 82 + col*(card_w+card_gap); yy0 = y + row*(card_h+22)
-                d.rounded_rectangle((x,yy0,x+card_w,yy0+card_h), radius=22, fill=white, outline=line, width=2)
                 factor = str(item.get("fator") or "GERAL")
-                crit = str(item.get("criticidade") or "")
-                d.text((x+28,yy0+25), factor, font=fonts["section"], fill=navy2)
+                crit = str(item.get("criticidade") or "").upper()
+                crit_col = (
+                    (214,52,71) if crit == "CRITICA" else
+                    (238,117,37) if crit == "ALTA" else
+                    (226,169,45) if crit == "MODERADA" else
+                    (46,160,104)
+                )
+                self._pdf_shadow_card(d, (x,yy0,x+card_w,yy0+card_h), radius=22, fill=white, outline=line, width=2, offset=7)
+                d.rounded_rectangle((x,yy0,x+12,yy0+card_h), radius=6, fill=crit_col)
+                d.text((x+30,yy0+24), factor, font=fonts["section"], fill=navy2)
                 if crit:
-                    d.text((x+28,yy0+78), f"Criticidade: {crit}", font=fonts["label"], fill=(203,91,39) if crit in ("ALTA","CRITICA") else gray)
+                    d.rounded_rectangle((x+30,yy0+78,x+275,yy0+118), radius=18, fill=crit_col)
+                    d.text((x+49,yy0+85), f"CRITICIDADE {crit}", font=fonts["label"], fill=white)
                 obs = item.get("observacao") or "Sem observacao adicional."
-                draw_wrapped(d, obs, (x+28,yy0+125), fonts["small"], dark, card_w-56, line_gap=6)
+                draw_wrapped(d, obs, (x+30,yy0+135), fonts["small"], dark, card_w-60, line_gap=6)
                 causes = item.get("causas_visuais") or []
                 if causes:
-                    d.text((x+28,yy0+274), "Indicacao visual:", font=fonts["label"], fill=gray)
-                    draw_wrapped(d, causes[0], (x+28,yy0+310), fonts["tiny"], gray, card_w-56, line_gap=4)
+                    d.text((x+30,yy0+282), "INDICACAO VISUAL", font=fonts["label"], fill=gray)
+                    draw_wrapped(d, causes[0], (x+30,yy0+316), fonts["tiny"], gray, card_w-60, line_gap=4)
 
         d.line((82,2260,1572,2260), fill=line, width=2)
         footer = (
@@ -3572,16 +3739,19 @@ class NR17Screen(BoxLayout):
             d.text((82,y), "ACOES PRIORITARIAS", font=fonts["section"], fill=navy); y+=70
             for idx,item in enumerate(items, start=1):
                 card_h = self._ai_action_card_height(d, item, fonts)
-                d.rounded_rectangle((82,y,1572,y+card_h), radius=24, fill=white, outline=line, width=3)
+                self._pdf_shadow_card(d, (82,y,1572,y+card_h), radius=24, fill=white, outline=line, width=2, offset=8)
                 prio = int(item.get("prioridade", idx) or idx)
-                d.rounded_rectangle((108,y+28,220,y+140), radius=20, fill=cyan if prio<=2 else navy2)
+                accent = cyan if prio <= 2 else navy2
+                d.rounded_rectangle((82,y,96,y+card_h), radius=7, fill=accent)
+                d.rounded_rectangle((108,y+28,220,y+140), radius=20, fill=accent)
                 d.text((142,y+52), str(prio), font=fonts["prio"], fill=white)
 
                 x=255
                 yy = draw_wrapped(d, str(item.get("acao") or "Acao nao informada"), (x,y+30), fonts["body_b"], dark, 1260, line_gap=7)
                 yy += 18
                 meta = f"TIPO: {str(item.get('tipo') or 'Melhoria').upper()}   |   FATOR: {str(item.get('fator') or 'GERAL').upper()}"
-                yy = draw_wrapped(d, meta, (x,yy), fonts["label"], navy2, 1260, line_gap=5)
+                d.rounded_rectangle((x, yy-4, min(1518, x+890), yy+38), radius=16, fill=(235,245,248))
+                yy = draw_wrapped(d, meta, (x+16,yy+2), fonts["label"], navy2, 1200, line_gap=5)
                 yy += 18
                 draw_wrapped(d, str(item.get("justificativa") or ""), (x,yy), fonts["small"], gray, 1260, line_gap=7)
                 y += card_h + 24
@@ -3777,9 +3947,12 @@ class NR17Screen(BoxLayout):
                 base_msg += f" · interpretacao complementar indisponivel: {self._ai_clip(self.ai_last_error or 'falha de rede/API', 120)}"
             elif ai_analysis:
                 fonte = str((ai_analysis or {}).get("fonte_analise") or "")
+                provedor = str((ai_analysis or {}).get("provedor") or "")
                 base_msg += " · interpretacao concluida"
                 if fonte == "somente_dados":
                     base_msg += " somente com dados medidos"
+                if provedor == "motor_local":
+                    base_msg += " · contingencia local"
             self.status_text = base_msg
         except Exception as exc:
             self.status_text = f"Erro ao gerar PDF: {exc}"
@@ -3804,11 +3977,15 @@ class NR17Screen(BoxLayout):
             gemini_ok = bool(GEMINI_API_KEY and "SUA_CHAVE" not in GEMINI_API_KEY)
             groq_ok = bool(GROQ_API_KEY and "SUA_CHAVE" not in GROQ_API_KEY)
             if not gemini_ok and not groq_ok:
-                self.ai_analysis = None
-                self.ai_model_used = None
                 self.ai_last_error = "Servicos de interpretacao nao configurados no APK."
-                self.status_text = "Interpretacao complementar nao configurada. Gerando PDF tecnico..."
-                Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, None, ai_failed=True), 0)
+                analysis = self._build_local_quantitative_analysis(snapshot, evidencias)
+                self.ai_analysis = analysis
+                self.ai_model_used = "local:quantitativo"
+                snapshot["analise_assistida"] = analysis
+                snapshot["motor_analise"] = self.ai_model_used
+                snapshot["fonte_analise"] = "somente_dados"
+                self.status_text = "Usando interpretacao quantitativa local · gerando relatorio completo..."
+                Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis, ai_failed=False), 0)
                 return
 
             self._ai_request_active = True
