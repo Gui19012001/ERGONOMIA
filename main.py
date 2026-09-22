@@ -3080,7 +3080,6 @@ class NR17Screen(BoxLayout):
         Clock.schedule_once(lambda dt: self._generate_report_files(snapshot, evidencias, analysis, ai_failed=False), 0)
 
     # --------------------------- PDF ---------------------------
-    # --------------------------- PDF ---------------------------
     def _risk_level_report(self, ire):
         ire = int(ire or 0)
         if ire >= 70:
